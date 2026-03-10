@@ -3,7 +3,7 @@
 AI-powered Burp Suite extension for OWASP-focused vulnerability detection, AI-assisted verification, and optional OOB/Intruder workflows.
 
 - Version: `1.2.0`
-- Runtime: `Jython (Python 2.7)`
+- Runtime: `Python 2.7`
 - Architecture: single file (`Code-AIxBurp.py`)
 
 ## Table of Contents
@@ -74,7 +74,7 @@ It also includes optional verification helpers:
 ## Requirements
 
 - Burp Suite with Extender support
-- Jython `2.7.x` configured in Burp (Python extensions run via Jython)
+- Python extension support enabled in Burp
 - Network access to your selected AI provider
 
 Optional/feature-specific:
@@ -85,15 +85,12 @@ Optional/feature-specific:
 ## Installation
 
 1. Download or copy `Code-AIxBurp.py`.
-2. In Burp Suite, set Jython:
-   - `Extender -> Options -> Python Environment`
-   - Select your `jython-standalone-2.7.x.jar`
-3. Load the extension:
+2. Load the extension:
    - `Extender -> Extensions -> Add`
    - Extension type: `Python`
    - Select `Code-AIxBurp.py`
-4. Open the `Code-AIxBurp` tab in Burp.
-5. Click `Settings` and configure provider/model/keys.
+3. Open the `Code-AIxBurp` tab in Burp.
+4. Click `Settings` and configure provider/model/keys.
 
 ## Quick Start
 
@@ -210,6 +207,7 @@ For a selected finding:
 4. Replay request and analyze response.
 5. Optionally run OOB collaborator probe for relevant families.
 6. Update finding status and evidence.
+7. When status is `Confirmed`, auto-create a new Burp issue prefixed with `[VERIFIED]` including verification evidence and a `curl` PoC.
 
 ### Vulnerability Families
 

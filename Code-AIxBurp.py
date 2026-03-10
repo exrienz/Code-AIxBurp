@@ -1690,6 +1690,7 @@ class BurpExtender(
                 "verified": "Pending",
                 "verification_details": "",
                 "verification_payload": "",
+                "verified_issue_created": False,
                 "messageInfo": messageInfo,
                 "vuln_details": vuln_details or {},
             }
@@ -2090,6 +2091,7 @@ class BurpExtender(
                 "evidence": "No clear indicator found",
                 "confidence": 50,
                 "payload": payload_candidates[0],
+                "request": "",
             }
             best_score = -1
             roundtrip_ms = 0
@@ -2163,6 +2165,7 @@ class BurpExtender(
                         "evidence": result.get("evidence", ""),
                         "confidence": candidate_conf,
                         "payload": candidate_payload,
+                        "request": modified_request,
                     }
 
                 if candidate_status == "Confirmed":
@@ -2216,6 +2219,7 @@ class BurpExtender(
             evidence = str(best_result.get("evidence", "")).strip()
             confidence = best_result.get("confidence")
             payload = best_result.get("payload", payload)
+            verified_request = best_result.get("request", "")
 
             details = evidence or "No clear indicator found"
             if confidence is not None:
@@ -2244,6 +2248,24 @@ class BurpExtender(
 
             self._updateVerificationStatus(findingIndex, status, details)
 
+            if status == "Confirmed":
+                if not verified_request:
+                    verified_request = self._injectPayload(
+                        req_str, payload, injection_point
+                    )
+                self._create_verified_scan_issue(
+                    findingIndex=findingIndex,
+                    finding=finding,
+                    messageInfo=messageInfo,
+                    payload=payload,
+                    injection_point=injection_point,
+                    evidence=evidence,
+                    verification_confidence=confidence,
+                    attempts_sent=attempts_sent,
+                    roundtrip_ms=roundtrip_ms,
+                    modified_request=verified_request or req_str,
+                )
+
             self.stdout.println("[VERIFY] Result: %s" % status)
             self.stdout.println("[VERIFY] Response Time: %d ms" % roundtrip_ms)
             if evidence:
@@ -2266,6 +2288,241 @@ class BurpExtender(
             self.stdout.println("[VERIFY] Details: %s" % str(details)[:300])
         if normalized_status == "Error" and details:
             self.stderr.println("[VERIFY][ERROR] %s" % str(details))
+
+    def _escape_html(self, value):
+        text = str(value or "")
+        return (
+            text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    def _shell_quote_single(self, value):
+        text = str(value or "")
+        return "'" + text.replace("'", "'\"'\"'") + "'"
+
+    def _split_http_request(self, request_text):
+        text = str(request_text or "")
+        if "\r\n\r\n" in text:
+            head, body = text.split("\r\n\r\n", 1)
+            lines = head.split("\r\n")
+        elif "\n\n" in text:
+            head, body = text.split("\n\n", 1)
+            lines = head.split("\n")
+        else:
+            body = ""
+            lines = text.splitlines()
+        return lines, body
+
+    def _build_url_from_request_target(self, messageInfo, target):
+        target = str(target or "").strip()
+        if not target:
+            target = "/"
+        if target.lower().startswith("http://") or target.lower().startswith("https://"):
+            return target
+
+        try:
+            request_info = self.helpers.analyzeRequest(messageInfo)
+            base_url = request_info.getUrl()
+            scheme = str(base_url.getProtocol() or "https")
+            host = str(base_url.getHost() or "")
+            port = int(base_url.getPort())
+        except Exception:
+            scheme = "https"
+            host = ""
+            port = -1
+
+        if not host:
+            return target
+
+        if port <= 0:
+            port = 443 if scheme == "https" else 80
+
+        include_port = not (
+            (scheme == "https" and port == 443) or (scheme == "http" and port == 80)
+        )
+        host_port = "%s:%d" % (host, port) if include_port else host
+        if not target.startswith("/"):
+            target = "/" + target
+        return "%s://%s%s" % (scheme, host_port, target)
+
+    def _build_curl_poc_from_request(self, messageInfo, request_text):
+        lines, body = self._split_http_request(request_text)
+        if not lines:
+            return ""
+
+        request_line = str(lines[0] or "").strip()
+        parts = request_line.split(" ")
+        method = parts[0].upper() if parts else "GET"
+        target = parts[1] if len(parts) > 1 else "/"
+        url = self._build_url_from_request_target(messageInfo, target)
+
+        cmd = ["curl", "-x", "http://127.0.0.1:8080", "-k", "-i", "-sS"]
+        if method and method != "GET":
+            cmd.extend(["-X", method])
+
+        for header in lines[1:]:
+            if not header or ":" not in header:
+                continue
+            lowered = header.lower()
+            if lowered.startswith("host:"):
+                continue
+            if lowered.startswith("content-length:"):
+                continue
+            if lowered.startswith("connection:"):
+                continue
+            if lowered.startswith("proxy-connection:"):
+                continue
+            cmd.extend(["-H", self._shell_quote_single(header)])
+
+        if body and method in ["POST", "PUT", "PATCH", "DELETE"]:
+            cmd.extend(["--data-binary", self._shell_quote_single(body)])
+
+        cmd.append(self._shell_quote_single(url))
+        return " ".join(cmd)
+
+    def _build_verified_issue_detail(
+        self,
+        finding,
+        verification_confidence,
+        evidence,
+        payload,
+        injection_point,
+        attempts_sent,
+        roundtrip_ms,
+        curl_poc,
+    ):
+        vuln_details = finding.get("vuln_details", {}) or {}
+        original_desc = str(vuln_details.get("detail", "")).strip()
+        original_desc = original_desc or "No original AI description available."
+        original_conf = str(finding.get("confidence", "Firm") or "Firm")
+
+        try:
+            conf_num = int(verification_confidence)
+        except Exception:
+            conf_num = 95
+        upgraded_conf = map_confidence(conf_num) or "Certain"
+
+        parameter = str(
+            injection_point
+            or vuln_details.get("param_name")
+            or finding.get("verification_injection_point")
+            or "<auto>"
+        )
+        verification_evidence = str(
+            evidence
+            or finding.get("verification_details")
+            or "No deterministic indicator was captured."
+        )
+        payload_text = str(payload or finding.get("verification_payload") or "N/A")
+        curl_text = str(curl_poc or "curl -x http://127.0.0.1:8080 '<target_url>'")
+
+        detail_parts = []
+        detail_parts.append("<b>VERIFIED BY PHASE 2 AI-DRIVEN TESTING</b><br>")
+        detail_parts.append(
+            "Confidence Upgraded: %s -&gt; %s<br><br>"
+            % (self._escape_html(original_conf), self._escape_html(upgraded_conf))
+        )
+
+        detail_parts.append("<b>Original Description:</b><br>")
+        detail_parts.append("%s<br><br>" % self._escape_html(original_desc))
+
+        detail_parts.append("<b>Verification Results:</b><br>")
+        detail_parts.append(
+            "Vulnerable Parameter: <code>%s</code><br>" % self._escape_html(parameter)
+        )
+        detail_parts.append(
+            "Successful Payload: <code>%s</code><br>" % self._escape_html(payload_text)
+        )
+        detail_parts.append(
+            "Heuristic Detection: %s<br>" % self._escape_html(verification_evidence)
+        )
+        detail_parts.append("AI Confidence: %d%%<br>" % int(conf_num))
+        if attempts_sent:
+            detail_parts.append("Payload Attempts: %d<br>" % int(attempts_sent))
+        if roundtrip_ms:
+            detail_parts.append("Observed Response Time: %d ms<br>" % int(roundtrip_ms))
+
+        detail_parts.append("<br><b>Proof of Concept:</b><br>")
+        detail_parts.append("<pre>%s</pre>" % self._escape_html(curl_text))
+
+        detail_parts.append("<br><b>AI Analysis:</b><br>")
+        detail_parts.append("%s" % self._escape_html(verification_evidence))
+
+        return "".join(detail_parts)
+
+    def _create_verified_scan_issue(
+        self,
+        findingIndex,
+        finding,
+        messageInfo,
+        payload,
+        injection_point,
+        evidence,
+        verification_confidence,
+        attempts_sent,
+        roundtrip_ms,
+        modified_request,
+    ):
+        if not messageInfo:
+            return
+
+        with self.findings_lock_ui:
+            if findingIndex < 0 or findingIndex >= len(self.findings_list):
+                return
+            if self.findings_list[findingIndex].get("verified_issue_created"):
+                return
+            self.findings_list[findingIndex]["verified_issue_created"] = True
+
+        title = str(finding.get("title", "AI Finding")).strip() or "AI Finding"
+        if title.startswith("[VERIFIED]"):
+            verified_title = title
+        else:
+            verified_title = "[VERIFIED] %s" % title
+
+        raw_severity = str(finding.get("severity", "Information")).strip()
+        severity = VALID_SEVERITIES.get(raw_severity.lower(), "Information")
+        if raw_severity in ["High", "Medium", "Low", "Information"]:
+            severity = raw_severity
+
+        try:
+            conf_num = int(verification_confidence)
+        except Exception:
+            conf_num = 95
+        verified_confidence = map_confidence(conf_num) or "Certain"
+
+        curl_poc = self._build_curl_poc_from_request(messageInfo, modified_request)
+        detail = self._build_verified_issue_detail(
+            finding=finding,
+            verification_confidence=conf_num,
+            evidence=evidence,
+            payload=payload,
+            injection_point=injection_point,
+            attempts_sent=attempts_sent,
+            roundtrip_ms=roundtrip_ms,
+            curl_poc=curl_poc,
+        )
+
+        try:
+            issue = CustomScanIssue(
+                messageInfo.getHttpService(),
+                self.helpers.analyzeRequest(messageInfo).getUrl(),
+                [messageInfo],
+                verified_title,
+                detail,
+                severity,
+                verified_confidence,
+            )
+            self.callbacks.addScanIssue(issue)
+            self._ui_dirty = True
+            self.updateStats("findings_created")
+            self.stdout.println("[VERIFY] Added verified Burp issue: %s" % verified_title)
+        except Exception as e:
+            with self.findings_lock_ui:
+                if findingIndex >= 0 and findingIndex < len(self.findings_list):
+                    self.findings_list[findingIndex]["verified_issue_created"] = False
+            self.stderr.println("[VERIFY] Failed to add verified issue: %s" % str(e))
 
     def build_verification_prompt(
         self,

@@ -188,6 +188,7 @@ class BurpExtender(
         self.ENABLE_INTRUDER_AUTOMATION = True
         self.MAX_VERIFICATION_ATTEMPTS = 4
         self.OOB_POLL_SECONDS = 18
+        self.SCAN_HISTORY_ON_START = False  # Auto passive scan proxy history on load
 
         # File extensions to skip during analysis (static/non-security-relevant files)
         self.SKIP_EXTENSIONS = [
@@ -310,6 +311,13 @@ class BurpExtender(
                     "[!] Please check Settings and verify your AI configuration."
                 )
 
+            # Auto-scan proxy history if the setting is enabled
+            if self.SCAN_HISTORY_ON_START:
+                self.stdout.println(
+                    "\n[HISTORY] Auto Scan History on Start is enabled - queuing proxy history..."
+                )
+                self._scanProxyHistoryThread()
+
         _conn_thread = threading.Thread(target=_startup_connection_test)
         _conn_thread.setDaemon(True)
         _conn_thread.start()
@@ -414,10 +422,19 @@ class BurpExtender(
         self.upgradeButton.setForeground(Color.WHITE)
         self.upgradeButton.setOpaque(True)
 
+        # Scan History button
+        self.scanHistoryButton = JButton(
+            "Scan Proxy History", actionPerformed=self.scanProxyHistory
+        )
+        self.scanHistoryButton.setToolTipText(
+            "Queue all in-scope proxy history items for passive AI analysis"
+        )
+
         controlPanel.add(self.settingsButton)
         controlPanel.add(self.clearButton)
         controlPanel.add(self.cancelAllButton)
         controlPanel.add(self.pauseAllButton)
+        controlPanel.add(self.scanHistoryButton)
         controlPanel.add(self.upgradeButton)
         topPanel.add(controlPanel)
 
@@ -1045,6 +1062,9 @@ class BurpExtender(
                 self.OOB_POLL_SECONDS = int(
                     config.get("oob_poll_seconds", self.OOB_POLL_SECONDS)
                 )
+                self.SCAN_HISTORY_ON_START = config.get(
+                    "scan_history_on_start", self.SCAN_HISTORY_ON_START
+                )
 
                 self.stdout.println(
                     "\n[CONFIG] Loaded saved configuration from %s" % self.config_file
@@ -1093,6 +1113,7 @@ class BurpExtender(
                 "enable_intruder_automation": self.ENABLE_INTRUDER_AUTOMATION,
                 "max_verification_attempts": int(self.MAX_VERIFICATION_ATTEMPTS),
                 "oob_poll_seconds": int(self.OOB_POLL_SECONDS),
+                "scan_history_on_start": self.SCAN_HISTORY_ON_START,
                 "version": self.VERSION,
                 "last_saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -1351,6 +1372,18 @@ class BurpExtender(
         advancedPanel.add(passiveScanCheck, gbc)
         row += 1
 
+        # Auto-scan history on start toggle
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("Auto Scan History:"), gbc)
+        gbc.gridx = 1
+        scanHistoryCheck = JCheckBox(
+            "Auto passive scan proxy history on extension load",
+            self.SCAN_HISTORY_ON_START,
+        )
+        advancedPanel.add(scanHistoryCheck, gbc)
+        row += 1
+
         # Enhanced testing toggles
         gbc.gridx = 0
         gbc.gridy = row
@@ -1528,6 +1561,7 @@ class BurpExtender(
 
             # Save Advanced settings
             self.PASSIVE_SCANNING_ENABLED = passiveScanCheck.isSelected()
+            self.SCAN_HISTORY_ON_START = scanHistoryCheck.isSelected()
             self.ENABLE_WAF_DETECTION = wafDetectCheck.isSelected()
             self.ENABLE_WAF_EVASION = wafEvasionCheck.isSelected()
             self.ENABLE_ADVANCED_PAYLOADS = advancedPayloadCheck.isSelected()
@@ -1604,6 +1638,10 @@ class BurpExtender(
             self.stdout.println(
                 "[SETTINGS] Passive Scanning: %s"
                 % ("Enabled" if self.PASSIVE_SCANNING_ENABLED else "Disabled")
+            )
+            self.stdout.println(
+                "[SETTINGS] Auto Scan History on Start: %s"
+                % ("Enabled" if self.SCAN_HISTORY_ON_START else "Disabled")
             )
             self.stdout.println(
                 "[SETTINGS] WAF Detection/Evasion: %s/%s"
@@ -4583,6 +4621,80 @@ class BurpExtender(
         self.stdout.println("")
         self.stdout.println("=" * 65)
         self.stdout.println("")
+
+    def scanProxyHistory(self, event=None):
+        """Queue all in-scope proxy history items for passive AI analysis."""
+        t = threading.Thread(target=self._scanProxyHistoryThread)
+        t.setDaemon(True)
+        t.start()
+
+    def _scanProxyHistoryThread(self):
+        """Background thread: iterate proxy history and queue each in-scope item."""
+        try:
+            history = self.callbacks.getProxyHistory()
+            if not history:
+                self.log_to_console("[HISTORY] Proxy history is empty - nothing to scan")
+                self.stdout.println("[HISTORY] Proxy history is empty - nothing to scan")
+                return
+
+            total = len(history)
+            self.log_to_console("[HISTORY] Starting passive scan of %d history items..." % total)
+            self.stdout.println("\n[HISTORY] Auto passive scan: %d history items found" % total)
+
+            queued = 0
+            skipped_scope = 0
+            skipped_ext = 0
+            skipped_no_response = 0
+            seen_urls = set()
+
+            for item in history:
+                try:
+                    req = self.helpers.analyzeRequest(item)
+                    url_str = str(req.getUrl())
+
+                    # Skip if no response recorded
+                    if item.getResponse() is None:
+                        skipped_no_response += 1
+                        continue
+
+                    # Skip out-of-scope
+                    if not self.is_in_scope(url_str):
+                        skipped_scope += 1
+                        continue
+
+                    # Skip static file extensions
+                    if self.should_skip_extension(url_str):
+                        skipped_ext += 1
+                        continue
+
+                    # Deduplicate by URL within this batch
+                    if url_str in seen_urls:
+                        continue
+                    seen_urls.add(url_str)
+
+                    task_id = self.addTask("HISTORY", url_str, "Queued", item)
+                    t = threading.Thread(
+                        target=self.analyze, args=(item, url_str, task_id)
+                    )
+                    t.setDaemon(True)
+                    t.start()
+                    queued += 1
+
+                except Exception as e:
+                    self.stderr.println("[!] History scan item error: %s" % e)
+
+            self.stdout.println(
+                "[HISTORY] Queued: %d | Skipped (out-of-scope): %d | "
+                "Skipped (static): %d | Skipped (no response): %d"
+                % (queued, skipped_scope, skipped_ext, skipped_no_response)
+            )
+            self.log_to_console(
+                "[HISTORY] Queued %d/%d items for analysis" % (queued, total)
+            )
+
+        except Exception as e:
+            self.stderr.println("[!] History scan failed: %s" % e)
+            self.log_to_console("[HISTORY] ERROR: %s" % e)
 
     def doPassiveScan(self, baseRequestResponse):
         # Check if passive scanning is enabled

@@ -4673,11 +4673,7 @@ class BurpExtender(
                     seen_urls.add(url_str)
 
                     task_id = self.addTask("HISTORY", url_str, "Queued", item)
-                    t = threading.Thread(
-                        target=self.analyze, args=(item, url_str, task_id)
-                    )
-                    t.setDaemon(True)
-                    t.start()
+                    self.analyze(item, url_str, task_id)
                     queued += 1
 
                 except Exception as e:

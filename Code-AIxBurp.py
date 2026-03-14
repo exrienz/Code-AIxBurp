@@ -149,7 +149,7 @@ class BurpExtender(
         self.stderr = ConsolePrintWriter(original_stderr, self)
 
         # Version Information
-        self.VERSION = "1.2.0"
+        self.VERSION = "1.3.0"
         self.EDITION = ""
         self.RELEASE_DATE = "2026-03-10"
         self.BUILD_ID = "bb90850f-1d2e-4d12-852e-842527475b37"
@@ -189,6 +189,7 @@ class BurpExtender(
         self.MAX_VERIFICATION_ATTEMPTS = 4
         self.OOB_POLL_SECONDS = 18
         self.SCAN_HISTORY_ON_START = False  # Auto passive scan proxy history on load
+        self.AUTO_VERIFY_FINDINGS = False  # Auto-verify findings when discovered
 
         # File extensions to skip during analysis (static/non-security-relevant files)
         self.SKIP_EXTENSIONS = [
@@ -289,11 +290,12 @@ class BurpExtender(
             )
         )
         self.stdout.println(
-            "[+] Advanced Payloads: %s | OOB: %s | Intruder Automation: %s"
+            "[+] Advanced Payloads: %s | OOB: %s | Intruder: %s | Auto-Verify: %s"
             % (
                 "ON" if self.ENABLE_ADVANCED_PAYLOADS else "OFF",
                 "ON" if self.ENABLE_OOB_TESTING else "OFF",
                 "ON" if self.ENABLE_INTRUDER_AUTOMATION else "OFF",
+                "ON" if self.AUTO_VERIFY_FINDINGS else "OFF",
             )
         )
         self.stdout.println("")
@@ -1065,6 +1067,9 @@ class BurpExtender(
                 self.SCAN_HISTORY_ON_START = config.get(
                     "scan_history_on_start", self.SCAN_HISTORY_ON_START
                 )
+                self.AUTO_VERIFY_FINDINGS = config.get(
+                    "auto_verify_findings", self.AUTO_VERIFY_FINDINGS
+                )
 
                 self.stdout.println(
                     "\n[CONFIG] Loaded saved configuration from %s" % self.config_file
@@ -1073,13 +1078,14 @@ class BurpExtender(
                     "[CONFIG] Provider: %s | Model: %s" % (self.AI_PROVIDER, self.MODEL)
                 )
                 self.stdout.println(
-                    "[CONFIG] WAF:%s Evasion:%s Payloads:%s OOB:%s Intruder:%s"
+                    "[CONFIG] WAF:%s Evasion:%s Payloads:%s OOB:%s Intruder:%s AutoVerify:%s"
                     % (
                         "ON" if self.ENABLE_WAF_DETECTION else "OFF",
                         "ON" if self.ENABLE_WAF_EVASION else "OFF",
                         "ON" if self.ENABLE_ADVANCED_PAYLOADS else "OFF",
                         "ON" if self.ENABLE_OOB_TESTING else "OFF",
                         "ON" if self.ENABLE_INTRUDER_AUTOMATION else "OFF",
+                        "ON" if self.AUTO_VERIFY_FINDINGS else "OFF",
                     )
                 )
             else:
@@ -1114,6 +1120,7 @@ class BurpExtender(
                 "max_verification_attempts": int(self.MAX_VERIFICATION_ATTEMPTS),
                 "oob_poll_seconds": int(self.OOB_POLL_SECONDS),
                 "scan_history_on_start": self.SCAN_HISTORY_ON_START,
+                "auto_verify_findings": self.AUTO_VERIFY_FINDINGS,
                 "version": self.VERSION,
                 "last_saved": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
@@ -1384,6 +1391,18 @@ class BurpExtender(
         advancedPanel.add(scanHistoryCheck, gbc)
         row += 1
 
+        # Auto-verify findings toggle
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("Auto Verify Findings:"), gbc)
+        gbc.gridx = 1
+        autoVerifyCheck = JCheckBox(
+            "Automatically verify findings when discovered (passive)",
+            self.AUTO_VERIFY_FINDINGS,
+        )
+        advancedPanel.add(autoVerifyCheck, gbc)
+        row += 1
+
         # Enhanced testing toggles
         gbc.gridx = 0
         gbc.gridy = row
@@ -1562,6 +1581,7 @@ class BurpExtender(
             # Save Advanced settings
             self.PASSIVE_SCANNING_ENABLED = passiveScanCheck.isSelected()
             self.SCAN_HISTORY_ON_START = scanHistoryCheck.isSelected()
+            self.AUTO_VERIFY_FINDINGS = autoVerifyCheck.isSelected()
             self.ENABLE_WAF_DETECTION = wafDetectCheck.isSelected()
             self.ENABLE_WAF_EVASION = wafEvasionCheck.isSelected()
             self.ENABLE_ADVANCED_PAYLOADS = advancedPayloadCheck.isSelected()
@@ -1733,7 +1753,22 @@ class BurpExtender(
                 "vuln_details": vuln_details or {},
             }
             self.findings_list.append(finding)
+            finding_index = len(self.findings_list) - 1
         self._ui_dirty = True
+
+        # Auto-verify finding if enabled (runs in background thread)
+        if self.AUTO_VERIFY_FINDINGS and messageInfo:
+            def auto_verify_thread():
+                try:
+                    # Small delay to not block the main analysis flow
+                    time.sleep(0.5)
+                    self.verify_finding(finding_index)
+                except Exception as e:
+                    self.stderr.println("[!] Auto-verification error: %s" % str(e))
+
+            t = threading.Thread(target=auto_verify_thread)
+            t.daemon = True
+            t.start()
 
     def _createFindingsPopupMenu(self):
         """Create right-click context menu for findings table"""

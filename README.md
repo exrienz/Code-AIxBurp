@@ -2,7 +2,7 @@
 
 AI-powered Burp Suite extension for OWASP-focused vulnerability detection, AI-assisted verification, and optional OOB/Intruder workflows.
 
-- Version: `1.2.0`
+- Version: `1.3.0`
 - Runtime: `Python 2.7`
 - Architecture: single file (`Code-AIxBurp.py`)
 
@@ -121,6 +121,7 @@ Settings are saved to:
 | `max_tokens` | `2048` | Request output token cap |
 | `ai_request_timeout` | `60` | Seconds; range `10-99999` |
 | `passive_scanning_enabled` | `true` | Auto-scan proxy/scanner passive traffic |
+| `auto_verify_findings` | `false` | Auto-verify findings when discovered |
 | `enable_waf_detection` | `true` | WAF fingerprinting |
 | `enable_waf_evasion` | `true` | Evasion payload transforms |
 | `enable_advanced_payloads` | `true` | Payload libraries per vuln family |
@@ -142,6 +143,7 @@ Settings are saved to:
   "max_tokens": 2048,
   "ai_request_timeout": 90,
   "passive_scanning_enabled": true,
+  "auto_verify_findings": false,
   "enable_waf_detection": true,
   "enable_waf_evasion": true,
   "enable_advanced_payloads": true,
@@ -196,6 +198,18 @@ Settings are saved to:
 `js`, `gif`, `jpg`, `png`, `ico`, `css`, `woff`, `woff2`, `ttf`, `svg`
 
 ## Verification, OOB, and Intruder
+
+### Auto-Verification
+
+When `auto_verify_findings` is enabled:
+
+1. Every finding discovered during passive scanning is automatically queued for verification
+2. Verification runs in a background thread (non-blocking)
+3. Findings are verified one-by-one with a small delay between each
+4. Status is updated in the Findings table as verification completes
+5. Confirmed findings automatically create `[VERIFIED]` Burp issues
+
+To enable: Settings → Advanced → Auto Verify Findings → Check "Automatically verify findings when discovered (passive)"
 
 ### Verification Flow
 
@@ -331,6 +345,7 @@ Findings right-click actions:
 
 ## Changelog
 
+- `v1.3.0` (2026-03-14): Auto-verification feature - automatically verify findings when discovered
 - `v1.2.0` (2026-03-10): WAF detection/evasion, advanced payload libraries, OOB collaborator testing, Intruder automation
 - `v1.1.1` (2025-02-04): moved network calls off EDT to prevent UI freeze
 - `v1.1.0` (2025-02-04): Linux UI responsiveness improvements

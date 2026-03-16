@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Burp Suite Python Extension: Code-AIxBurp
-# Version: 1.2.0
-# Release Date: 2026-03-10
+# Version: 1.4.0
+# Release Date: 2026-03-15
 # License: MIT License
 # Build-ID: bb90850f-1d2e-4d12-852e-842527475b37
 #
@@ -21,6 +21,11 @@
 # - Automated fuzzing with Burp Intruder integration
 #
 # Changelog:
+# v1.4.0 (2026-03-15) - Architecture: section banners, bare-except fixes, thread pool, task auto-prune, messageInfo extraction,
+#                        graceful unload. AI: system/user role prompts, JSON mode for all providers. Scanning: configurable
+#                        concurrency, GraphQL detection. Verification: differential timing, multi-step chains, export findings,
+#                        progress indicator. UI: detail panel, search/filter, console log levels.
+# v1.3.0 (2026-03-14) - Auto-verification feature
 # v1.2.0 (2026-03-10) - Added WAF detection/evasion, advanced payload libraries, OOB collaborator testing, and Intruder automation
 # v1.1.1 (2025-02-04) - Fix Settings freeze and slow startup: move network calls off EDT to background threads
 # v1.1.0 (2025-02-04) - Fix UI hang on Linux: dirty-flag refresh guard, incremental console, remove EDT lock contention
@@ -35,6 +40,10 @@
 # v1.0.1 (2025-01-31) - Added configurable timeout, retry logic
 # v1.0.0 (2025-01-31) - Initial stable release
 
+# ============================================================================
+#  IMPORTS
+# ============================================================================
+
 from burp import (
     IBurpExtender,
     IHttpListener,
@@ -44,6 +53,7 @@ from burp import (
     IContextMenuFactory,
     IIntruderPayloadGeneratorFactory,
     IIntruderPayloadGenerator,
+    IExtensionStateListener,
 )
 from java.io import PrintWriter
 from java.awt import (
@@ -70,8 +80,13 @@ from javax.swing import (
     Box,
     JMenuItem,
     JPopupMenu,
+    JToggleButton,
+    JTextField,
+    JEditorPane,
+    JFileChooser,
 )
 from javax.swing.table import DefaultTableModel, DefaultTableCellRenderer
+from javax.swing.event import DocumentListener
 from java.lang import Runnable
 from java.util import ArrayList
 import json
@@ -82,6 +97,15 @@ import hashlib
 from jarray import array as jarray_array
 from datetime import datetime
 
+try:
+    from Queue import Queue, Empty
+except ImportError:
+    from queue import Queue, Empty
+
+# ============================================================================
+#  CONSTANTS
+# ============================================================================
+
 VALID_SEVERITIES = {
     "high": "High",
     "medium": "Medium",
@@ -91,6 +115,12 @@ VALID_SEVERITIES = {
     "info": "Information",
     "inform": "Information",
 }
+
+# Console log levels
+LOG_INFO = "INFO"
+LOG_DEBUG = "DEBUG"
+LOG_WARN = "WARN"
+LOG_ERROR = "ERROR"
 
 
 def map_confidence(ai_confidence):
@@ -104,6 +134,11 @@ def map_confidence(ai_confidence):
         return "Certain"
 
 
+# ============================================================================
+#  HELPER CLASSES
+# ============================================================================
+
+
 # Custom PrintWriter wrapper to capture console output
 class ConsolePrintWriter:
     def __init__(self, original_writer, extender_ref):
@@ -115,7 +150,7 @@ class ConsolePrintWriter:
         if hasattr(self.extender, "log_to_console"):
             try:
                 self.extender.log_to_console(str(message))
-            except:
+            except Exception as e:
                 pass
 
     def print_(self, message):
@@ -128,6 +163,11 @@ class ConsolePrintWriter:
         self.original.flush()
 
 
+# ============================================================================
+#  BURP EXTENDER (MAIN CLASS)
+# ============================================================================
+
+
 class BurpExtender(
     IBurpExtender,
     IHttpListener,
@@ -135,6 +175,7 @@ class BurpExtender(
     ITab,
     IContextMenuFactory,
     IIntruderPayloadGeneratorFactory,
+    IExtensionStateListener,
 ):
     def registerExtenderCallbacks(self, callbacks):
         self.callbacks = callbacks
@@ -149,9 +190,9 @@ class BurpExtender(
         self.stderr = ConsolePrintWriter(original_stderr, self)
 
         # Version Information
-        self.VERSION = "1.3.0"
+        self.VERSION = "1.4.0"
         self.EDITION = ""
-        self.RELEASE_DATE = "2026-03-10"
+        self.RELEASE_DATE = "2026-03-15"
         self.BUILD_ID = "bb90850f-1d2e-4d12-852e-842527475b37"
 
         callbacks.setExtensionName("Code-AIxBurp")
@@ -190,6 +231,8 @@ class BurpExtender(
         self.OOB_POLL_SECONDS = 18
         self.SCAN_HISTORY_ON_START = False  # Auto passive scan proxy history on load
         self.AUTO_VERIFY_FINDINGS = False  # Auto-verify findings when discovered
+        self.SCAN_CONCURRENCY = 3  # Concurrent scan worker threads (1-5)
+        self.MAX_TASK_HISTORY = 500  # Auto-prune task list beyond this
 
         # File extensions to skip during analysis (static/non-security-relevant files)
         self.SKIP_EXTENSIONS = [
@@ -211,6 +254,22 @@ class BurpExtender(
         self.collaborator_contexts = {}
         self.collaborator_lock = threading.Lock()
         self.intruder_payload_factory_registered = False
+
+        # Shutdown flag for graceful unload
+        self._shutting_down = False
+        self._shutdown_event = threading.Event()
+
+        # Thread pool (work queue + workers)
+        self._work_queue = Queue(maxsize=200)
+        self._worker_threads = []
+
+        # Console log level toggles (all enabled by default)
+        self._log_level_enabled = {
+            LOG_INFO: True,
+            LOG_DEBUG: True,
+            LOG_WARN: True,
+            LOG_ERROR: True,
+        }
 
         # Load saved configuration (if exists)
         self.load_config()
@@ -327,8 +386,14 @@ class BurpExtender(
         # Add UI tab
         callbacks.addSuiteTab(self)
 
+        # Register extension state listener for graceful unload
+        callbacks.registerExtensionStateListener(self)
+
         # Register Intruder payload factory
         self._sync_intruder_payload_factory()
+
+        # Start worker thread pool
+        self._start_worker_pool()
 
         # Start auto-refresh timer for Console
         self.start_auto_refresh_timer()
@@ -478,7 +543,9 @@ class BurpExtender(
         findingsPanel = JPanel(BorderLayout())
         findingsPanel.setBorder(BorderFactory.createTitledBorder("Findings"))
 
-        # Findings stats
+        # Findings stats + filter bar + Export button
+        findingsTopPanel = JPanel(BorderLayout())
+
         findingsStatsPanel = JPanel(FlowLayout(FlowLayout.LEFT))
         self.findingsStatsLabel = JLabel(
             "Total: 0 | High: 0 | Medium: 0 | Low: 0 | Info: 0"
@@ -497,7 +564,35 @@ class BurpExtender(
             lambda e: self._verifyAllPendingFindings()
         )
         findingsStatsPanel.add(verifyPendingButton)
-        findingsPanel.add(findingsStatsPanel, BorderLayout.NORTH)
+
+        # Export button
+        exportButton = JButton("Export Findings")
+        exportButton.addActionListener(lambda e: self._exportFindings())
+        findingsStatsPanel.add(exportButton)
+
+        findingsTopPanel.add(findingsStatsPanel, BorderLayout.WEST)
+
+        # Search / filter bar
+        filterPanel = JPanel(FlowLayout(FlowLayout.RIGHT))
+        filterPanel.add(JLabel("Filter: "))
+        self.findingsFilterField = JTextField(20)
+        self.findingsFilterField.setToolTipText("Filter by URL, title, severity, or status")
+
+        class FindingsFilterListener(DocumentListener):
+            def __init__(self, extender):
+                self.extender = extender
+            def insertUpdate(self, e):
+                self.extender._applyFindingsFilter()
+            def removeUpdate(self, e):
+                self.extender._applyFindingsFilter()
+            def changedUpdate(self, e):
+                self.extender._applyFindingsFilter()
+
+        self.findingsFilterField.getDocument().addDocumentListener(FindingsFilterListener(self))
+        filterPanel.add(self.findingsFilterField)
+        findingsTopPanel.add(filterPanel, BorderLayout.EAST)
+
+        findingsPanel.add(findingsTopPanel, BorderLayout.NORTH)
 
         self.findingsTableModel = DefaultTableModel()
         self.findingsTableModel.addColumn("Discovered At")
@@ -536,7 +631,38 @@ class BurpExtender(
         self._installFindingsTableMouseHandler()
 
         findingsScrollPane = JScrollPane(self.findingsTable)
-        findingsPanel.add(findingsScrollPane, BorderLayout.CENTER)
+
+        # Inside findings: split between table and detail panel
+        findingsInnerSplit = JSplitPane(JSplitPane.VERTICAL_SPLIT)
+        findingsInnerSplit.setResizeWeight(0.65)
+        findingsInnerSplit.setTopComponent(findingsScrollPane)
+
+        # Detail panel (HTML)
+        self.findingDetailPane = JEditorPane()
+        self.findingDetailPane.setContentType("text/html")
+        self.findingDetailPane.setEditable(False)
+        self.findingDetailPane.setText("<html><body style='font-family:monospace;padding:8px;color:#666;'>"
+                                       "<i>Select a finding to view details</i></body></html>")
+        detailScrollPane = JScrollPane(self.findingDetailPane)
+        detailScrollPane.setPreferredSize(Dimension(0, 150))
+        findingsInnerSplit.setBottomComponent(detailScrollPane)
+
+        findingsPanel.add(findingsInnerSplit, BorderLayout.CENTER)
+        self.findingsInnerSplit = findingsInnerSplit
+
+        # Listen for table row selection to update detail panel
+        from javax.swing.event import ListSelectionListener
+
+        class FindingsSelectionListener(ListSelectionListener):
+            def __init__(self, extender):
+                self.extender = extender
+            def valueChanged(self, e):
+                if not e.getValueIsAdjusting():
+                    self.extender._updateFindingDetailPanel()
+
+        self.findingsTable.getSelectionModel().addListSelectionListener(
+            FindingsSelectionListener(self)
+        )
 
         # Create nested split pane for Findings and Console - equal sizing
         bottomSplitPane = JSplitPane(JSplitPane.VERTICAL_SPLIT)
@@ -586,6 +712,20 @@ class BurpExtender(
             ScrollListener(self)
         )
 
+        # Console log level filter buttons
+        consoleTopPanel = JPanel(FlowLayout(FlowLayout.LEFT))
+        consoleTopPanel.add(JLabel("Log Levels: "))
+
+        self._log_level_buttons = {}
+        for level in [LOG_INFO, LOG_DEBUG, LOG_WARN, LOG_ERROR]:
+            btn = JToggleButton(level, True)
+            btn.setFont(Font("Monospaced", Font.BOLD, 10))
+            level_ref = level  # capture for closure
+            btn.addActionListener(lambda e, lv=level_ref: self._toggleLogLevel(lv, e))
+            self._log_level_buttons[level] = btn
+            consoleTopPanel.add(btn)
+
+        consolePanel.add(consoleTopPanel, BorderLayout.NORTH)
         consolePanel.add(consoleScrollPane, BorderLayout.CENTER)
 
         bottomSplitPane.setBottomComponent(consolePanel)
@@ -763,7 +903,7 @@ class BurpExtender(
                                 self.extender.consoleTextArea.setCaretPosition(
                                     doc.getLength()
                                 )
-                            except:
+                            except Exception:
                                 pass
 
                 finally:
@@ -773,13 +913,17 @@ class BurpExtender(
         self._refresh_pending = True
         SwingUtilities.invokeLater(RefreshRunnable(self))
 
+    # ─── Thread Pool & Lifecycle ─────────────────────────────────────────
+
     def start_auto_refresh_timer(self):
         """Auto-refresh UI and check for stuck tasks"""
 
         def refresh_timer():
             check_interval = 0
-            while True:
-                time.sleep(5)
+            while not self._shutting_down:
+                self._shutdown_event.wait(5)
+                if self._shutting_down:
+                    break
                 self.refreshUI()
 
                 # Check for stuck tasks periodically (every ~30 seconds)
@@ -791,6 +935,114 @@ class BurpExtender(
         timer_thread = threading.Thread(target=refresh_timer)
         timer_thread.setDaemon(True)
         timer_thread.start()
+
+    def _start_worker_pool(self):
+        """Start N daemon worker threads that pull tasks from the work queue."""
+        count = max(1, min(5, int(self.SCAN_CONCURRENCY)))
+        for i in range(count):
+            t = threading.Thread(target=self._worker_thread, name="Worker-%d" % i)
+            t.setDaemon(True)
+            t.start()
+            self._worker_threads.append(t)
+        self.stdout.println("[POOL] Started %d worker thread(s)" % count)
+
+    def _worker_thread(self):
+        """Worker loop: pull (callable, args) from queue and execute."""
+        while not self._shutting_down:
+            try:
+                item = self._work_queue.get(timeout=2)
+            except Empty:
+                continue
+            if item is None:
+                break
+            func, args = item
+            try:
+                func(*args)
+            except Exception as e:
+                self.stderr.println("[POOL] Worker error: %s" % str(e))
+
+    def _queue_work(self, func, *args):
+        """Submit work to the thread pool. Falls back to direct thread if queue full."""
+        if self._shutting_down:
+            return
+        try:
+            self._work_queue.put_nowait((func, args))
+        except Exception:
+            # Queue full — spawn a direct thread as fallback
+            t = threading.Thread(target=func, args=args)
+            t.setDaemon(True)
+            t.start()
+
+    def extensionUnloaded(self):
+        """IExtensionStateListener — clean shutdown of all threads."""
+        self.stdout.println("\n[SHUTDOWN] Extension unloading — stopping threads...")
+        self._shutting_down = True
+        self._shutdown_event.set()
+
+        # Poison-pill for each worker
+        for _ in self._worker_threads:
+            try:
+                self._work_queue.put_nowait(None)
+            except Exception:
+                pass
+
+        # Wait for workers to finish
+        for t in self._worker_threads:
+            try:
+                t.join(timeout=3)
+            except Exception:
+                pass
+
+        self.stdout.println("[SHUTDOWN] All threads stopped. Extension unloaded cleanly.")
+
+    def _prune_tasks(self):
+        """Auto-prune completed/error/cancelled tasks when list exceeds MAX_TASK_HISTORY."""
+        with self.tasks_lock:
+            if len(self.tasks) <= self.MAX_TASK_HISTORY:
+                return
+            # Keep all active tasks, prune oldest completed ones
+            active = []
+            completed = []
+            for task in self.tasks:
+                status = task.get("status", "")
+                if "Completed" in status or "Error" in status or "Cancelled" in status or "Skipped" in status:
+                    completed.append(task)
+                else:
+                    active.append(task)
+            # Keep most recent completed tasks up to limit
+            keep_completed = self.MAX_TASK_HISTORY - len(active)
+            if keep_completed < 0:
+                keep_completed = 0
+            self.tasks = active + completed[-keep_completed:]
+
+    def _extract_message_data(self, messageInfo):
+        """Extract lightweight data dict from messageInfo to avoid holding Burp object references."""
+        if not messageInfo:
+            return None
+        try:
+            request_bytes = messageInfo.getRequest()
+            response_bytes = messageInfo.getResponse()
+            http_service = messageInfo.getHttpService()
+            return {
+                "request_bytes": request_bytes[:] if request_bytes else None,
+                "response_bytes": response_bytes[:] if response_bytes else None,
+                "host": str(http_service.getHost()) if http_service else "",
+                "port": int(http_service.getPort()) if http_service else 443,
+                "protocol": str(http_service.getProtocol()) if http_service else "https",
+            }
+        except Exception as e:
+            self.stderr.println("[!] messageInfo extraction error: %s" % str(e))
+            return None
+
+    def _rebuild_http_service(self, msg_data):
+        """Rebuild an IHttpService from extracted message data."""
+        if not msg_data:
+            return None
+        return self.callbacks.helpers.buildHttpService(
+            msg_data.get("host", ""),
+            msg_data.get("port", 443),
+            msg_data.get("protocol", "https"),
+        )
 
     def check_stuck_tasks(self):
         """Automatically check for stuck tasks and log warnings"""
@@ -1064,6 +1316,9 @@ class BurpExtender(
                 self.OOB_POLL_SECONDS = int(
                     config.get("oob_poll_seconds", self.OOB_POLL_SECONDS)
                 )
+                self.SCAN_CONCURRENCY = max(1, min(5, int(
+                    config.get("scan_concurrency", self.SCAN_CONCURRENCY)
+                )))
                 self.SCAN_HISTORY_ON_START = config.get(
                     "scan_history_on_start", self.SCAN_HISTORY_ON_START
                 )
@@ -1119,6 +1374,7 @@ class BurpExtender(
                 "enable_intruder_automation": self.ENABLE_INTRUDER_AUTOMATION,
                 "max_verification_attempts": int(self.MAX_VERIFICATION_ATTEMPTS),
                 "oob_poll_seconds": int(self.OOB_POLL_SECONDS),
+                "scan_concurrency": int(self.SCAN_CONCURRENCY),
                 "scan_history_on_start": self.SCAN_HISTORY_ON_START,
                 "auto_verify_findings": self.AUTO_VERIFY_FINDINGS,
                 "version": self.VERSION,
@@ -1143,7 +1399,7 @@ class BurpExtender(
             import webbrowser
 
             webbrowser.open("https://code-x.my")
-        except:
+        except Exception:
             self.stdout.println("[UPDATE] Please visit: https://code-x.my")
 
     def openSettings(self, event):
@@ -1278,7 +1534,7 @@ class BurpExtender(
                             refreshModelsBtn.setText("Refresh")
 
                         SwingUtilities.invokeLater(lambda: _restore())
-                except:
+                except Exception:
 
                     def _restore():
                         refreshModelsBtn.setEnabled(True)
@@ -1505,6 +1761,14 @@ class BurpExtender(
         advancedPanel.add(oobPollField, gbc)
         row += 1
 
+        gbc.gridx = 0
+        gbc.gridy = row
+        advancedPanel.add(JLabel("Max Concurrent Scans (1-5):"), gbc)
+        gbc.gridx = 1
+        concurrencyField = JTextField(str(self.SCAN_CONCURRENCY), 10)
+        advancedPanel.add(concurrencyField, gbc)
+        row += 1
+
         # Help text for timeout
         gbc.gridx = 0
         gbc.gridy = row
@@ -1514,7 +1778,7 @@ class BurpExtender(
             "Range: 10 to 99999 seconds (27.7 hours max).\n"
             "Increase if you get timeout errors.\n"
             "Recommended: 30-120s (fast models), 180-600s (large models).\n"
-            "Verification attempts range: 1-10. OOB poll range: 6-120s."
+            "Verification attempts: 1-10. OOB poll: 6-120s. Concurrency: 1-5."
         )
         timeoutHelp.setEditable(False)
         timeoutHelp.setBackground(advancedPanel.getBackground())
@@ -1638,6 +1902,17 @@ class BurpExtender(
                 self.OOB_POLL_SECONDS = 18
                 self.stderr.println("[!] Invalid OOB poll value, using default: 18")
 
+            try:
+                concurrency = int(concurrencyField.getText())
+                if concurrency < 1:
+                    concurrency = 1
+                elif concurrency > 5:
+                    concurrency = 5
+                self.SCAN_CONCURRENCY = concurrency
+            except ValueError:
+                self.SCAN_CONCURRENCY = 3
+                self.stderr.println("[!] Invalid concurrency value, using default: 3")
+
             self.advanced_payload_library = self._build_advanced_payload_library()
             self._sync_intruder_payload_factory()
 
@@ -1707,7 +1982,20 @@ class BurpExtender(
         # Show dialog
         dialog.setVisible(True)
 
-    def log_to_console(self, message):
+    # ─── Console & UI Support Methods ────────────────────────────────────
+
+    def log_to_console(self, message, level=LOG_INFO):
+        """Log a message to the console with optional log level."""
+        # Auto-detect level from message content if not explicitly set
+        if level == LOG_INFO:
+            msg_lower = str(message).lower()
+            if "[debug]" in msg_lower:
+                level = LOG_DEBUG
+            elif "[!]" in msg_lower or "error" in msg_lower:
+                level = LOG_ERROR
+            elif "warn" in msg_lower:
+                level = LOG_WARN
+
         with self.console_lock:
             timestamp = datetime.now().strftime("%H:%M:%S")
             message_str = str(message)
@@ -1726,17 +2014,159 @@ class BurpExtender(
             if len(message_str) > 150:
                 message_str = message_str[:147] + "..."
 
-            formatted_msg = "[%s] %s" % (timestamp, message_str)
-            self.console_messages.append(formatted_msg)
+            formatted_msg = "[%s] [%s] %s" % (timestamp, level, message_str)
 
-            if len(self.console_messages) > self.max_console_messages:
-                self.console_messages = self.console_messages[
-                    -self.max_console_messages :
-                ]
+            # Only show if this level is enabled
+            if self._log_level_enabled.get(level, True):
+                self.console_messages.append(formatted_msg)
+
+                if len(self.console_messages) > self.max_console_messages:
+                    self.console_messages = self.console_messages[
+                        -self.max_console_messages :
+                    ]
         self._ui_dirty = True
 
+    def _toggleLogLevel(self, level, event):
+        """Toggle a console log level on/off."""
+        btn = self._log_level_buttons.get(level)
+        if btn:
+            self._log_level_enabled[level] = btn.isSelected()
+
+    def _applyFindingsFilter(self):
+        """Filter the findings table based on the search field text."""
+        filter_text = self.findingsFilterField.getText().strip().lower()
+
+        class FilterRunnable(Runnable):
+            def __init__(self, extender, filter_text):
+                self.extender = extender
+                self.filter_text = filter_text
+
+            def run(self):
+                model = self.extender.findingsTableModel
+                model.setRowCount(0)
+                with self.extender.findings_lock_ui:
+                    for finding in self.extender.findings_list:
+                        # Build searchable text from finding fields
+                        searchable = " ".join([
+                            str(finding.get("url", "")),
+                            str(finding.get("title", "")),
+                            str(finding.get("severity", "")),
+                            str(finding.get("verified", "")),
+                        ]).lower()
+
+                        if not self.filter_text or self.filter_text in searchable:
+                            model.addRow([
+                                finding.get("discovered_at", ""),
+                                finding.get("url", ""),
+                                finding.get("title", ""),
+                                finding.get("severity", ""),
+                                finding.get("confidence", ""),
+                                finding.get("verified", "Pending"),
+                            ])
+
+        SwingUtilities.invokeLater(FilterRunnable(self, filter_text))
+
+    def _updateFindingDetailPanel(self):
+        """Update the detail panel when a finding row is selected."""
+        row = self.findingsTable.getSelectedRow()
+        if row < 0:
+            return
+
+        with self.findings_lock_ui:
+            if row >= len(self.findings_list):
+                # Filter may be active; find the finding by table data
+                try:
+                    url = str(self.findingsTableModel.getValueAt(row, 1))
+                    title_val = str(self.findingsTableModel.getValueAt(row, 2))
+                    finding = None
+                    for f in self.findings_list:
+                        if f.get("url") == url and f.get("title") == title_val:
+                            finding = f
+                            break
+                except Exception:
+                    finding = None
+            else:
+                finding = self.findings_list[row]
+
+        if not finding:
+            return
+
+        vuln = finding.get("vuln_details") or {}
+        html_parts = [
+            "<html><body style='font-family:monospace;padding:8px;font-size:12px;'>",
+            "<h3>%s</h3>" % self.html_escape(finding.get("title", "")),
+            "<b>URL:</b> %s<br>" % self.html_escape(finding.get("url", "")),
+            "<b>Severity:</b> %s &nbsp; <b>Confidence:</b> %s<br>" % (
+                finding.get("severity", ""), finding.get("confidence", "")),
+            "<b>Verification:</b> %s<br>" % finding.get("verified", "Pending"),
+        ]
+
+        if vuln.get("cwe"):
+            html_parts.append("<b>CWE:</b> %s<br>" % self.html_escape(str(vuln["cwe"])))
+        if vuln.get("owasp"):
+            html_parts.append("<b>OWASP:</b> %s<br>" % self.html_escape(str(vuln["owasp"])))
+        if vuln.get("detail"):
+            html_parts.append("<br><b>Description:</b><br>%s<br>" % self.html_escape(str(vuln["detail"])))
+
+        verify_detail = finding.get("verification_detail", "")
+        if verify_detail:
+            html_parts.append("<br><b>Verification Evidence:</b><br>%s<br>" % self.html_escape(str(verify_detail)))
+
+        html_parts.append("</body></html>")
+        final_html = "".join(html_parts)
+
+        def _set():
+            self.findingDetailPane.setText(final_html)
+            self.findingDetailPane.setCaretPosition(0)
+
+        SwingUtilities.invokeLater(lambda: _set())
+
+    def _exportFindings(self):
+        """Export all findings to a JSON file."""
+        from javax.swing import JFileChooser
+        from javax.swing.filechooser import FileNameExtensionFilter
+
+        chooser = JFileChooser()
+        chooser.setDialogTitle("Export Findings")
+        chooser.setFileFilter(FileNameExtensionFilter("JSON Files", ["json"]))
+
+        result = chooser.showSaveDialog(self.panel)
+        if result != JFileChooser.APPROVE_OPTION:
+            return
+
+        file_path = str(chooser.getSelectedFile().getAbsolutePath())
+        if not file_path.endswith(".json"):
+            file_path += ".json"
+
+        export_data = []
+        with self.findings_lock_ui:
+            for finding in self.findings_list:
+                entry = {
+                    "discovered_at": finding.get("discovered_at", ""),
+                    "url": finding.get("url", ""),
+                    "title": finding.get("title", ""),
+                    "severity": finding.get("severity", ""),
+                    "confidence": finding.get("confidence", ""),
+                    "verified": finding.get("verified", "Pending"),
+                    "verification_detail": finding.get("verification_detail", ""),
+                }
+                vuln = finding.get("vuln_details") or {}
+                entry["cwe"] = vuln.get("cwe", "")
+                entry["owasp"] = vuln.get("owasp", "")
+                entry["detail"] = vuln.get("detail", "")
+                export_data.append(entry)
+
+        try:
+            with open(file_path, "w") as f:
+                f.write(json.dumps(export_data, indent=2))
+            self.log_to_console("[EXPORT] %d findings exported to %s" % (len(export_data), file_path))
+            self.stdout.println("[EXPORT] Findings exported to: %s" % file_path)
+        except Exception as e:
+            self.stderr.println("[!] Export failed: %s" % str(e))
+            self.log_to_console("[EXPORT] ERROR: %s" % str(e), level=LOG_ERROR)
+
     def add_finding(
-        self, url, title, severity, confidence, messageInfo=None, vuln_details=None
+        self, url, title, severity, confidence, messageInfo=None, vuln_details=None, issue_data=None
     ):
         with self.findings_lock_ui:
             finding = {
@@ -1749,8 +2179,10 @@ class BurpExtender(
                 "verification_details": "",
                 "verification_payload": "",
                 "verified_issue_created": False,
+                "sitemap_issue_created": False,
                 "messageInfo": messageInfo,
                 "vuln_details": vuln_details or {},
+                "issue_data": issue_data,
             }
             self.findings_list.append(finding)
             finding_index = len(self.findings_list) - 1
@@ -1952,6 +2384,21 @@ class BurpExtender(
                 ] = "Status set manually"
         self._ui_dirty = True
 
+    def _update_finding_status(self, model_row, status_text):
+        """Update the verification column for a finding to show progress."""
+        with self.findings_lock_ui:
+            if model_row < len(self.findings_list):
+                self.findings_list[model_row]["verified"] = status_text
+        self._ui_dirty = True
+
+    def html_escape(self, text):
+        """Simple HTML escape for display in JEditorPane."""
+        return (str(text)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;"))
+
     def _performVerification(self, finding, findingIndex):
         """Backward-compatible wrapper for existing calls."""
         self.verify_finding(findingIndex, finding)
@@ -1963,6 +2410,10 @@ class BurpExtender(
                 if findingIndex < 0 or findingIndex >= len(self.findings_list):
                     return
                 finding = self.findings_list[findingIndex]
+                # Ensure finding is a dict
+                if not isinstance(finding, dict):
+                    self.stderr.println("[!] Finding at index %d is not a dict: %s" % (findingIndex, type(finding)))
+                    return
                 self.findings_list[findingIndex]["verified"] = "Verifying..."
                 self.findings_list[findingIndex]["verification_details"] = ""
             self._ui_dirty = True
@@ -1970,6 +2421,9 @@ class BurpExtender(
             url = finding.get("url", "")
             title = finding.get("title", "")
             vuln_details = finding.get("vuln_details", {})
+            # Ensure vuln_details is a dict
+            if not isinstance(vuln_details, dict):
+                vuln_details = {}
             messageInfo = finding.get("messageInfo")
 
             if not messageInfo:
@@ -2170,7 +2624,11 @@ class BurpExtender(
             roundtrip_ms = 0
             attempts_sent = 0
 
-            for candidate_payload in payload_candidates:
+            for idx, candidate_payload in enumerate(payload_candidates):
+                # Progress indicator (6.4)
+                progress_status = "Verifying (%d/%d)..." % (idx + 1, len(payload_candidates))
+                self._update_finding_status(findingIndex, progress_status)
+
                 modified_request = self._injectPayload(
                     req_str, candidate_payload, injection_point
                 )
@@ -2178,7 +2636,7 @@ class BurpExtender(
                     continue
 
                 attempts_sent += 1
-                self.stdout.println("[VERIFY] Payload: %s" % candidate_payload[:120])
+                self.stdout.println("[VERIFY] Payload %d/%d: %s" % (idx + 1, len(payload_candidates), candidate_payload[:120]))
                 started_at = time.time()
                 verification_response = self.callbacks.makeHttpRequest(
                     httpService, self.helpers.stringToBytes(modified_request)
@@ -2239,6 +2697,8 @@ class BurpExtender(
                         "confidence": candidate_conf,
                         "payload": candidate_payload,
                         "request": modified_request,
+                        "response": ver_resp_str,
+                        "status_code": status_code,
                     }
 
                 if candidate_status == "Confirmed":
@@ -2298,6 +2758,10 @@ class BurpExtender(
             if confidence is not None:
                 details = "Confidence %s: %s" % (confidence, details)
 
+            # Store the verification response for POC evidence
+            verification_response_text = best_result.get("response", "")
+            verification_status_code = best_result.get("status_code", 0)
+
             with self.findings_lock_ui:
                 if findingIndex < len(self.findings_list):
                     self.findings_list[findingIndex]["verification_payload"] = payload
@@ -2313,6 +2777,12 @@ class BurpExtender(
                     self.findings_list[findingIndex][
                         "verification_attempts"
                     ] = attempts_sent
+                    self.findings_list[findingIndex][
+                        "verification_response"
+                    ] = verification_response_text
+                    self.findings_list[findingIndex][
+                        "verification_status_code"
+                    ] = verification_status_code
                     if waf_profile.get("detected"):
                         self.findings_list[findingIndex]["waf_vendor"] = waf_profile.get(
                             "vendor", "Generic WAF"
@@ -2337,6 +2807,7 @@ class BurpExtender(
                     attempts_sent=attempts_sent,
                     roundtrip_ms=roundtrip_ms,
                     modified_request=verified_request or req_str,
+                    verification_response=verification_response_text,
                 )
 
             self.stdout.println("[VERIFY] Result: %s" % status)
@@ -2351,16 +2822,103 @@ class BurpExtender(
     def _updateVerificationStatus(self, findingIndex, status, details=""):
         """Update the verification status of a finding"""
         normalized_status = self._normalizeVerificationStatus(status)
+        # Sanitize details to prevent unicode encoding errors
+        safe_details = self._safe_ascii(details) if details else ""
+
+        # Auto-remove findings with Error or False Positive status
+        if normalized_status in ["Error", "False Positive"]:
+            self._removeFinding(findingIndex, normalized_status, safe_details)
+            return
+
         with self.findings_lock_ui:
             if findingIndex < len(self.findings_list):
                 self.findings_list[findingIndex]["verified"] = normalized_status
-                self.findings_list[findingIndex]["verification_details"] = details
+                self.findings_list[findingIndex]["verification_details"] = safe_details
+
+        # Add to sitemap for Confirmed or Uncertain findings (not yet added)
+        if normalized_status in ["Confirmed", "Uncertain"]:
+            self._addFindingToSitemap(findingIndex)
+
         self._ui_dirty = True
         self.stdout.println("[VERIFY] Status updated: %s" % normalized_status)
+        if safe_details:
+            self.stdout.println("[VERIFY] Details: %s" % safe_details[:300])
+
+    def _removeFinding(self, findingIndex, status, details=""):
+        """Remove a finding from the list (auto-cleanup for Error/False Positive)"""
+        finding_title = ""
+        finding_url = ""
+        with self.findings_lock_ui:
+            if findingIndex < 0 or findingIndex >= len(self.findings_list):
+                return
+            finding = self.findings_list[findingIndex]
+            finding_title = finding.get("title", "Unknown")
+            finding_url = finding.get("url", "")
+            # Remove the finding from the list
+            del self.findings_list[findingIndex]
+        self._ui_dirty = True
+        self.stdout.println(
+            "[VERIFY] Auto-removed %s finding: %s" % (status, finding_title)
+        )
         if details:
-            self.stdout.println("[VERIFY] Details: %s" % str(details)[:300])
-        if normalized_status == "Error" and details:
-            self.stderr.println("[VERIFY][ERROR] %s" % str(details))
+            self.stdout.println("[VERIFY] Reason: %s" % details[:200])
+
+    def _addFindingToSitemap(self, findingIndex):
+        """Add a verified finding to Burp's sitemap (Target > Site map > Issues)"""
+        with self.findings_lock_ui:
+            if findingIndex < 0 or findingIndex >= len(self.findings_list):
+                return
+            finding = self.findings_list[findingIndex]
+            if finding.get("sitemap_issue_created"):
+                return  # Already added
+            issue_data = finding.get("issue_data")
+            if not issue_data:
+                return  # No issue data stored
+
+        try:
+            # Create and add the scan issue
+            issue = CustomScanIssue(
+                issue_data.get("httpService"),
+                issue_data.get("url"),
+                [issue_data.get("messageInfo")],
+                issue_data.get("title"),
+                issue_data.get("detail"),
+                issue_data.get("severity"),
+                issue_data.get("confidence"),
+            )
+            self.callbacks.addScanIssue(issue)
+            with self.findings_lock_ui:
+                if findingIndex < len(self.findings_list):
+                    self.findings_list[findingIndex]["sitemap_issue_created"] = True
+            self.updateStats("findings_created")
+            self.stdout.println(
+                "[SITEMAP] Added verified issue: %s" % issue_data.get("title", "Unknown")
+            )
+        except Exception as e:
+            self.stderr.println("[SITEMAP] Failed to add issue: %s" % str(e))
+
+    def _safe_ascii(self, text):
+        """Convert unicode to ASCII-safe string for Jython/Python2 compatibility.
+
+        Replaces non-ASCII characters with '?' to prevent encoding errors
+        when building prompts that may contain unicode from HTTP responses.
+        """
+        if not text:
+            return ""
+        try:
+            # Handle unicode type (Python 2 / Jython)
+            if isinstance(text, unicode):
+                return text.encode('ascii', 'replace').decode('ascii')
+            # Handle str that might contain UTF-8 bytes
+            if isinstance(text, str):
+                try:
+                    return text.decode('utf-8', 'ignore').encode('ascii', 'replace')
+                except (UnicodeDecodeError, UnicodeEncodeError, AttributeError):
+                    pass
+            return str(text)
+        except Exception:
+            # Ultimate fallback - strip anything non-printable
+            return ''.join(c if ord(c) < 128 else '?' for c in str(text))
 
     def _escape_html(self, value):
         text = str(value or "")
@@ -2465,6 +3023,7 @@ class BurpExtender(
         attempts_sent,
         roundtrip_ms,
         curl_poc,
+        verification_response="",
     ):
         vuln_details = finding.get("vuln_details", {}) or {}
         original_desc = str(vuln_details.get("detail", "")).strip()
@@ -2517,8 +3076,14 @@ class BurpExtender(
         if roundtrip_ms:
             detail_parts.append("Observed Response Time: %d ms<br>" % int(roundtrip_ms))
 
-        detail_parts.append("<br><b>Proof of Concept:</b><br>")
+        detail_parts.append("<br><b>Proof of Concept (cURL):</b><br>")
         detail_parts.append("<pre>%s</pre>" % self._escape_html(curl_text))
+
+        # Add actual verification response as POC evidence
+        if verification_response:
+            response_preview = str(verification_response)[:4000]
+            detail_parts.append("<br><b>Verification Response (POC Evidence):</b><br>")
+            detail_parts.append("<pre>%s</pre>" % self._escape_html(response_preview))
 
         detail_parts.append("<br><b>AI Analysis:</b><br>")
         detail_parts.append("%s" % self._escape_html(verification_evidence))
@@ -2537,6 +3102,7 @@ class BurpExtender(
         attempts_sent,
         roundtrip_ms,
         modified_request,
+        verification_response="",
     ):
         if not messageInfo:
             return
@@ -2575,6 +3141,7 @@ class BurpExtender(
             attempts_sent=attempts_sent,
             roundtrip_ms=roundtrip_ms,
             curl_poc=curl_poc,
+            verification_response=verification_response,
         )
 
         try:
@@ -2627,24 +3194,30 @@ class BurpExtender(
             "Original HTTP request (truncated):\n%s\n\n"
             "Original HTTP response snippet:\n%s\n\n"
             "Output ONLY valid JSON with this exact shape:\n"
-            '{"payload":"...","injection_point":"param_or_header","detection_method":"...",'
+            '{"payload":"...","injection_point":"ACTUAL_PARAM_NAME","detection_method":"...",'
             '"safe":true,"payload_family":"...","verification_nonce":"%s"}\n'
-            "Guidance:\n"
+            "CRITICAL injection_point rules:\n"
+            "- injection_point MUST be the EXACT parameter name from the request (e.g., 'id', 'name', 'query', 'testCaseId')\n"
+            "- For URL path injection, use the path segment value (e.g., '01990d61-ebad-7d1d-a012-1349bd38cc41')\n"
+            "- For header injection, use the header name (e.g., 'X-Forwarded-For', 'User-Agent')\n"
+            "- For JSON body, use the JSON key name (e.g., 'username', 'data')\n"
+            "- NEVER use generic terms like 'param', 'body', 'path', 'header' - use the ACTUAL name\n"
+            "- Look at the request and find the real parameter/field name to inject into\n\n"
+            "Other guidance:\n"
             "- payload_family must match expected family when possible\n"
             "- payload should be specific to this finding, URL, and parameter\n"
             "- Include the exact verification nonce in payload when syntax allows\n"
             "- Use harmless markers and clear detection logic\n"
             "- For time-based checks, use short delays (2-3 seconds)\n"
-            "- If no obvious parameter exists, choose best candidate from request\n"
         ) % (
             verification_nonce or "scv-default",
             vuln_family,
-            vuln_title,
-            json.dumps(vuln_details, sort_keys=True),
-            json.dumps(finding_context, sort_keys=True),
+            self._safe_ascii(vuln_title),
+            json.dumps(vuln_details, sort_keys=True, ensure_ascii=True),
+            json.dumps(finding_context, sort_keys=True, ensure_ascii=True),
             param_hint or "<auto>",
-            request[:2000],
-            response[:1200],
+            self._safe_ascii(request[:2000]),
+            self._safe_ascii(response[:1200]),
             verification_nonce or "scv-default",
         )
 
@@ -2773,7 +3346,7 @@ class BurpExtender(
         )
         try:
             source_bytes = source.encode("utf-8")
-        except:
+        except Exception:
             source_bytes = str(source)
         digest = hashlib.md5(source_bytes).hexdigest()[:8]
         return "scv-%s" % digest
@@ -2806,7 +3379,7 @@ class BurpExtender(
         confidence = parsed.get("confidence")
         try:
             confidence = int(float(confidence))
-        except:
+        except Exception:
             confidence = None
 
         return {
@@ -2826,7 +3399,7 @@ class BurpExtender(
                 return parsed
             if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
                 return parsed[0]
-        except:
+        except Exception:
             pass
 
         starts = [idx for idx, ch in enumerate(cleaned) if ch == "{"]
@@ -2844,7 +3417,7 @@ class BurpExtender(
                             parsed = json.loads(candidate)
                             if isinstance(parsed, dict):
                                 return parsed
-                        except:
+                        except Exception:
                             break
         return None
 
@@ -2902,6 +3475,83 @@ class BurpExtender(
             return True
         return False
 
+    def _is_dynamic_path_value(self, value):
+        """Check if a path segment value looks like a dynamic parameter (ID, UUID, number).
+
+        Returns True for values that appear to be dynamic/injectable:
+        - Pure numeric IDs: 3305, 12345
+        - UUIDs: 01990d61-ebad-7d1d-a012-1349bd38cc41
+        - Alphanumeric IDs with numbers: user123, item_456
+        - Base64-like tokens: eyJhbGciOiJIUzI1NiJ9
+
+        Returns False for static path segments:
+        - Resource names: status, versions, users, test-cases
+        - API version prefixes: v1, v2
+        - Actions: create, update, delete
+        """
+        import re
+
+        if not value:
+            return False
+
+        val = str(value).strip()
+        if not val:
+            return False
+
+        # Pure numeric - definitely a dynamic ID
+        if val.isdigit():
+            return True
+
+        # UUID pattern (with or without dashes)
+        uuid_pattern = r'^[0-9a-fA-F]{8}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{4}-?[0-9a-fA-F]{12}$'
+        if re.match(uuid_pattern, val):
+            return True
+
+        # Hex string (likely a hash or ID) - at least 16 chars
+        if re.match(r'^[0-9a-fA-F]{16,}$', val):
+            return True
+
+        # Base64-like token (contains mix of upper, lower, digits, and common base64 chars)
+        if len(val) > 20 and re.match(r'^[A-Za-z0-9+/=_-]+$', val):
+            # Check for base64-ish entropy (mix of cases and digits)
+            has_upper = any(c.isupper() for c in val)
+            has_lower = any(c.islower() for c in val)
+            has_digit = any(c.isdigit() for c in val)
+            if has_upper and has_lower and has_digit:
+                return True
+
+        # Alphanumeric with embedded numbers (user123, item_456, order-789)
+        # But must have at least one digit to be considered dynamic
+        if re.match(r'^[a-zA-Z0-9_-]+$', val) and any(c.isdigit() for c in val):
+            # Exclude version patterns like v1, v2, api2
+            if re.match(r'^(v\d+|api\d*)$', val.lower()):
+                return False
+            return True
+
+        # Common static path segments - definitely not dynamic
+        static_segments = {
+            'status', 'versions', 'version', 'users', 'user', 'items', 'item',
+            'create', 'update', 'delete', 'list', 'get', 'post', 'put', 'patch',
+            'api', 'v1', 'v2', 'v3', 'test', 'tests', 'test-cases', 'testcases',
+            'auth', 'login', 'logout', 'register', 'profile', 'settings',
+            'admin', 'public', 'private', 'internal', 'external',
+            'health', 'healthcheck', 'ping', 'info', 'metrics',
+            'search', 'filter', 'sort', 'export', 'import', 'download', 'upload',
+            'active', 'inactive', 'pending', 'approved', 'rejected',
+            'management', 'config', 'configuration', 'metadata',
+        }
+        if val.lower() in static_segments:
+            return False
+
+        # If it's purely alphabetic with dashes/underscores, likely a static segment
+        if re.match(r'^[a-zA-Z]+(-[a-zA-Z]+)*$', val):
+            return False
+        if re.match(r'^[a-zA-Z]+(_[a-zA-Z]+)*$', val):
+            return False
+
+        # Default: if we can't determine, be conservative and reject
+        return False
+
     def _normalizeHeaderInjectionPoint(self, injection_point):
         point = str(injection_point or "").strip()
         generic = [
@@ -2925,7 +3575,7 @@ class BurpExtender(
         return point
 
     def _heuristicVerificationResult(
-        self, payload, detection_method, response, response_time_ms=None
+        self, payload, detection_method, response, response_time_ms=None, messageInfo=None
     ):
         response_text = str(response or "")
         lowered = response_text.lower()
@@ -2943,12 +3593,26 @@ class BurpExtender(
             and response_time_ms >= 2500
             and "time" in str(detection_method or "").lower()
         ):
-            return {
-                "status": "Confirmed",
-                "evidence": "Observed delayed response (%d ms) for time-based payload"
-                % int(response_time_ms),
-                "confidence": 80,
-            }
+            # Differential timing: send baseline request to compare
+            baseline_ms = 500  # default fallback
+            try:
+                if messageInfo:
+                    baseline_start = time.time()
+                    self.callbacks.makeHttpRequest(
+                        messageInfo.getHttpService(), messageInfo.getRequest()
+                    )
+                    baseline_ms = int((time.time() - baseline_start) * 1000)
+            except Exception:
+                baseline_ms = 500
+
+            delta_ms = response_time_ms - baseline_ms
+            if delta_ms >= 1800:
+                return {
+                    "status": "Confirmed",
+                    "evidence": "Differential timing: payload=%dms baseline=%dms delta=%dms"
+                    % (int(response_time_ms), baseline_ms, delta_ms),
+                    "confidence": 80,
+                }
 
         block_markers = [
             "access denied",
@@ -3085,6 +3749,20 @@ class BurpExtender(
                         request_line = " ".join(request_parts)
                         modified = True
 
+                    # Path segment injection: /api/v1/3305/versions -> /api/v1/PAYLOAD/versions
+                    # Only inject into dynamic path values (IDs, UUIDs, numbers), not static segment names
+                    if not modified and injection_point:
+                        path_part = original_target.split("?")[0]
+                        if injection_point in path_part and self._is_dynamic_path_value(injection_point):
+                            new_path = path_part.replace(injection_point, encoded_payload, 1)
+                            if "?" in original_target:
+                                updated_target = new_path + "?" + original_target.split("?", 1)[1]
+                            else:
+                                updated_target = new_path
+                            request_parts[1] = updated_target
+                            request_line = " ".join(request_parts)
+                            modified = True
+
             content_type = ""
             for header in headers:
                 if header.lower().startswith("content-type:"):
@@ -3103,6 +3781,76 @@ class BurpExtender(
                     body = updated_body
                     modified = True
                     body_modified = True
+
+            # JSON body injection: {"ids": [1,2,3]} -> {"ids": "PAYLOAD"}
+            # Also try if body looks like JSON (starts with { or [) even without explicit content-type
+            body_looks_like_json = body and (body.strip().startswith("{") or body.strip().startswith("["))
+            if (
+                not modified
+                and not is_header_point
+                and body
+                and ("application/json" in content_type or body_looks_like_json)
+                and injection_point
+            ):
+                try:
+                    import re
+                    # Match JSON key with string value: "key": "value"
+                    json_str_pattern = r'("%s"\s*:\s*)"([^"]*)"' % re.escape(injection_point)
+                    escaped_payload = payload.replace('\\', '\\\\').replace('"', '\\"')
+                    updated_body, count = re.subn(
+                        json_str_pattern,
+                        r'\1"%s"' % escaped_payload,
+                        body,
+                        1
+                    )
+                    if count > 0:
+                        body = updated_body
+                        modified = True
+                        body_modified = True
+                    else:
+                        # Match JSON key with numeric value: "key": 123
+                        json_num_pattern = r'("%s"\s*:\s*)([0-9]+)' % re.escape(injection_point)
+                        updated_body, count = re.subn(
+                            json_num_pattern,
+                            r'\1"%s"' % escaped_payload,
+                            body,
+                            1
+                        )
+                        if count > 0:
+                            body = updated_body
+                            modified = True
+                            body_modified = True
+                        else:
+                            # Match JSON key with array value: "key": [...] (handles nested arrays)
+                            # Use a more robust pattern that counts brackets
+                            json_arr_pattern = r'("%s"\s*:\s*)(\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\])' % re.escape(injection_point)
+                            updated_body, count = re.subn(
+                                json_arr_pattern,
+                                r'\1"%s"' % escaped_payload,
+                                body,
+                                1
+                            )
+                            if count > 0:
+                                body = updated_body
+                                modified = True
+                                body_modified = True
+                            else:
+                                # Match JSON key with boolean/null value: "key": true/false/null
+                                json_bool_pattern = r'("%s"\s*:\s*)(true|false|null)' % re.escape(injection_point)
+                                updated_body, count = re.subn(
+                                    json_bool_pattern,
+                                    r'\1"%s"' % escaped_payload,
+                                    body,
+                                    1,
+                                    re.IGNORECASE
+                                )
+                                if count > 0:
+                                    body = updated_body
+                                    modified = True
+                                    body_modified = True
+                except Exception as json_inject_err:
+                    if self.VERBOSE:
+                        self.stderr.println("[!] JSON injection error: %s" % str(json_inject_err))
 
             if not modified:
                 return None
@@ -3827,7 +4575,7 @@ class BurpExtender(
                 req_info = self.helpers.analyzeRequest(messageInfo)
                 try:
                     host = str(req_info.getUrl().getHost() or "")
-                except:
+                except Exception:
                     host = ""
 
                 resp = messageInfo.getResponse()
@@ -3840,7 +4588,7 @@ class BurpExtender(
                             body_text = self.helpers.bytesToString(
                                 resp[resp_info.getBodyOffset() :]
                             )[:4000]
-                        except:
+                        except Exception:
                             body_text = ""
         except Exception:
             pass
@@ -3942,7 +4690,7 @@ class BurpExtender(
         for param in params:
             try:
                 param_type = int(param.getType())
-            except:
+            except Exception:
                 param_type = -1
             if param_type in [0, 1, 2, 6]:
                 name = str(param.getName() or "")
@@ -4023,7 +4771,7 @@ class BurpExtender(
         host = ""
         try:
             host = str(request_info.getUrl().getHost() or "default")
-        except:
+        except Exception:
             host = "default"
 
         collab_context = self._get_or_create_collaborator_context(host)
@@ -4177,7 +4925,10 @@ class BurpExtender(
             with self.stats_lock:
                 self.stats["total_requests"] += 1
             self._ui_dirty = True
-            return len(self.tasks) - 1
+            task_id = len(self.tasks) - 1
+        # Auto-prune outside lock
+        self._prune_tasks()
+        return task_id
 
     def updateTask(self, task_id, status, error=None):
         with self.tasks_lock:
@@ -4280,7 +5031,7 @@ class BurpExtender(
                 if unique_key not in seen_keys:
                     seen_keys.add(unique_key)
                     unique_messages.append(message)
-            except:
+            except Exception:
                 pass
 
         if len(unique_messages) == 0:
@@ -4323,11 +5074,7 @@ class BurpExtender(
                 self.stdout.println("[CONTEXT MENU] Running analysis...")
                 task_id = self.addTask("CONTEXT", url_str, "Queued", message)
                 # Use special forced analysis that bypasses deduplication
-                t = threading.Thread(
-                    target=self.analyze_forced, args=(message, url_str, task_id)
-                )
-                t.setDaemon(True)
-                t.start()
+                self._queue_work(self.analyze_forced, message, url_str, task_id)
             except Exception as e:
                 self.stderr.println("[!] Context menu error: %s" % e)
 
@@ -4708,11 +5455,7 @@ class BurpExtender(
                     seen_urls.add(url_str)
 
                     task_id = self.addTask("HISTORY", url_str, "Queued", item)
-                    t = threading.Thread(
-                        target=self.analyze, args=(item, url_str, task_id)
-                    )
-                    t.setDaemon(True)
-                    t.start()
+                    self._queue_work(self.analyze, item, url_str, task_id)
                     queued += 1
 
                 except Exception as e:
@@ -4754,15 +5497,11 @@ class BurpExtender(
             if self.should_skip_extension(url_str):
                 return None
 
-        except:
+        except Exception as e:
             url_str = "Unknown"
 
         task_id = self.addTask("PASSIVE", url_str, "Queued", baseRequestResponse)
-        t = threading.Thread(
-            target=self.analyze, args=(baseRequestResponse, url_str, task_id)
-        )
-        t.setDaemon(True)
-        t.start()
+        self._queue_work(self.analyze, baseRequestResponse, url_str, task_id)
         return None
 
     def doActiveScan(self, baseRequestResponse, insertionPoint):
@@ -4809,7 +5548,7 @@ class BurpExtender(
                         )
                     return True
             return False
-        except:
+        except Exception:
             return False
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
@@ -4842,13 +5581,11 @@ class BurpExtender(
             if self.should_skip_extension(url_str):
                 return
 
-        except:
+        except Exception as e:
             url_str = "Unknown"
 
         task_id = self.addTask("HTTP", url_str, "Queued", messageInfo)
-        t = threading.Thread(target=self.analyze, args=(messageInfo, url_str, task_id))
-        t.setDaemon(True)
-        t.start()
+        self._queue_work(self.analyze, messageInfo, url_str, task_id)
 
     def analyze(self, messageInfo, url_str=None, task_id=None):
         with self.semaphore:
@@ -5001,6 +5738,34 @@ class BurpExtender(
                 }
                 for p in params[:5]
             ]
+            # GraphQL detection
+            graphql_operation = ""
+            graphql_variables = ""
+            try:
+                is_graphql = "/graphql" in url.lower()
+                content_type = ""
+                for h in req_headers:
+                    if h.lower().startswith("content-type:"):
+                        content_type = h.lower()
+                        break
+                if not is_graphql and "application/json" in content_type and req_body:
+                    try:
+                        body_json = json.loads(req_body)
+                        if isinstance(body_json, dict) and "query" in body_json:
+                            is_graphql = True
+                            graphql_operation = body_json.get("operationName", "")
+                            graphql_variables = json.dumps(body_json.get("variables", {}))
+                    except Exception:
+                        pass
+                if is_graphql and not graphql_operation and req_body:
+                    try:
+                        body_json = json.loads(req_body)
+                        graphql_operation = body_json.get("operationName", "")
+                        graphql_variables = json.dumps(body_json.get("variables", {}))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
 
             data = {
                 "url": url,
@@ -5015,6 +5780,11 @@ class BurpExtender(
                 "response_body": res_body,
                 "waf_profile": waf_profile,
             }
+
+            if graphql_operation:
+                data["graphql_operation"] = graphql_operation
+            if graphql_variables:
+                data["graphql_variables"] = graphql_variables
 
             if self.VERBOSE:
                 self.stdout.println("[%s] Analyzing (NEW)" % source)
@@ -5149,7 +5919,7 @@ class BurpExtender(
                                 try:
                                     obj = json.loads(obj_str)
                                     findings.append(obj)
-                                except:
+                                except Exception:
                                     pass
 
                             if findings:
@@ -5158,7 +5928,7 @@ class BurpExtender(
                                     % len(findings)
                                 )
                                 repaired = True
-                    except:
+                    except Exception:
                         pass
 
                 if not repaired:
@@ -5278,20 +6048,8 @@ class BurpExtender(
 
                 full_detail = "".join(detail_parts)
 
-                issue = CustomScanIssue(
-                    messageInfo.getHttpService(),
-                    req.getUrl(),
-                    [messageInfo],
-                    title,
-                    full_detail,
-                    severity,
-                    burp_conf,
-                )
-                self.callbacks.addScanIssue(issue)
-                created += 1
-                self.updateStats("findings_created")
-
                 # Store vulnerability details for verification
+                # Note: Issue is NOT added to sitemap here - only after verification
                 vuln_details = {
                     "cwe": cwe,
                     "detail": detail,
@@ -5299,7 +6057,20 @@ class BurpExtender(
                     "owasp": item.get("owasp", ""),
                     "waf_profile": waf_profile,
                 }
-                self.add_finding(url, title, severity, burp_conf, messageInfo, vuln_details)
+
+                # Store issue data for later addition to sitemap (after verification)
+                issue_data = {
+                    "httpService": messageInfo.getHttpService(),
+                    "url": req.getUrl(),
+                    "messageInfo": messageInfo,
+                    "title": title,
+                    "detail": full_detail,
+                    "severity": severity,
+                    "confidence": burp_conf,
+                }
+
+                created += 1
+                self.add_finding(url, title, severity, burp_conf, messageInfo, vuln_details, issue_data)
 
             if self.VERBOSE:
                 self.stdout.println(
@@ -5311,23 +6082,32 @@ class BurpExtender(
             self.stderr.println("[!] %s error: %s" % (source, e))
             self.updateStats("errors")
 
+    # ─── AI Prompt Building ────────────────────────────────────────────
+
     def build_prompt(self, data):
-        return (
-            "Security expert. Output ONLY JSON array. NO markdown.\n"
-            "Analyze for OWASP Top 10, CWE.\n"
-            "Categories: Injection, XSS, Auth, Access Control, Misconfiguration, SSRF, Path Traversal, SSTI.\n"
-            'Format: {"title":"name","severity":"High|Medium|Low|Information",'
+        """Build a structured messages list with system/user role separation."""
+        system_msg = (
+            "You are a security expert specializing in web application vulnerability analysis. "
+            "You MUST output ONLY a valid JSON array with NO markdown, NO commentary. "
+            "Analyze HTTP traffic for OWASP Top 10 and CWE vulnerabilities. "
+            "Categories: Injection, XSS, Broken Authentication, Access Control, "
+            "Security Misconfiguration, SSRF, Path Traversal, SSTI. "
+            'Each finding: {"title":"name","severity":"High|Medium|Low|Information",'
             '"confidence":50-100,"detail":"desc","cwe":"CWE-X",'
-            '"owasp":"A0X:2021","remediation":"fix"}\n'
-            "Data:\n%s\n"
-        ) % json.dumps(data, indent=2)
+            '"owasp":"A0X:2021","remediation":"fix"}'
+        )
+        user_msg = "Analyze this HTTP traffic data:\n%s" % json.dumps(data, indent=2)
+        return [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ]
 
     def _normalize_ai_temperature(self, temperature):
         if temperature is None:
             return 0.0
         try:
             value = float(temperature)
-        except:
+        except Exception:
             value = 0.0
         if value < 0.0:
             return 0.0
@@ -5335,33 +6115,61 @@ class BurpExtender(
             return 1.0
         return value
 
+    # ─── AI Provider Adapters ──────────────────────────────────────────
+
     def ask_ai(self, prompt, temperature=None):
+        """Send prompt to AI. Accepts either a string or a messages list."""
         ai_temperature = self._normalize_ai_temperature(temperature)
+        # Normalize to messages list
+        # Handle both str and unicode types (Python 2/Jython compatibility)
+        if isinstance(prompt, basestring):
+            # Sanitize string content - remove null bytes and invalid UTF-8
+            try:
+                clean_prompt = prompt.replace("\x00", "").encode("utf-8", "ignore").decode("utf-8", "ignore")
+            except Exception:
+                clean_prompt = str(prompt)
+            messages = [{"role": "user", "content": clean_prompt}]
+        else:
+            messages = prompt
+
+
         try:
             if self.AI_PROVIDER == "Ollama":
-                return self._ask_ollama(prompt, ai_temperature)
+                return self._ask_ollama(messages, ai_temperature)
             elif self.AI_PROVIDER == "OpenAI":
-                return self._ask_openai(prompt, ai_temperature)
+                return self._ask_openai(messages, ai_temperature)
             elif self.AI_PROVIDER == "Claude":
-                return self._ask_claude(prompt, ai_temperature)
+                return self._ask_claude(messages, ai_temperature)
             elif self.AI_PROVIDER == "Gemini":
-                return self._ask_gemini(prompt, ai_temperature)
+                return self._ask_gemini(messages, ai_temperature)
             elif self.AI_PROVIDER == "OpenAI Compatible":
-                return self._ask_openai_compatible(prompt, ai_temperature)
+                return self._ask_openai_compatible(messages, ai_temperature)
             else:
                 self.stderr.println("[!] Unknown AI provider: %s" % self.AI_PROVIDER)
                 return None
+        except urllib2.HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8", "ignore")[:500]
+            except Exception:
+                pass
+            self.stderr.println("[!] AI request failed: %s" % e)
+            if error_body:
+                self.stderr.println("[!] Error details: %s" % error_body)
+            return None
         except Exception as e:
             self.stderr.println("[!] AI request failed: %s" % e)
             return None
 
-    def _ask_ollama(self, prompt, temperature=0.0):
-        """Send request to Ollama with timeout and retry logic"""
+    def _ask_ollama(self, messages, temperature=0.0):
+        """Send request to Ollama with timeout and retry logic."""
         generate_url = self.API_URL.rstrip("/") + "/api/generate"
+        # Ollama uses 'prompt' string — concatenate messages
+        prompt_text = "\n".join(m["content"] for m in messages)
 
         payload = {
             "model": self.MODEL,
-            "prompt": prompt,
+            "prompt": prompt_text,
             "stream": False,
             "format": "json",
             "options": {"temperature": temperature, "num_predict": self.MAX_TOKENS},
@@ -5383,7 +6191,6 @@ class BurpExtender(
                     headers={"Content-Type": "application/json"},
                 )
 
-                # Use configurable timeout
                 resp = urllib2.urlopen(req, timeout=self.AI_REQUEST_TIMEOUT)
 
                 raw = resp.read().decode("utf-8", "ignore")
@@ -5403,35 +6210,31 @@ class BurpExtender(
                             "[!] Request timeout, retrying... (%d/%d)"
                             % (retry_count, max_retries)
                         )
-                        time.sleep(2)  # Wait 2 seconds before retry
+                        time.sleep(2)
                     else:
                         self.stderr.println(
                             "[!] Request failed after %d retries (timeout: %ds)"
                             % (max_retries, int(self.AI_REQUEST_TIMEOUT))
                         )
-                        self.stderr.println(
-                            "[!] Try increasing timeout in Settings or using a faster model"
-                        )
                         raise
                 else:
-                    # Non-timeout error, don't retry
                     raise
             except Exception as e:
-                # Other errors, don't retry
                 raise
 
         return None
 
-    def _ask_openai(self, prompt, temperature=0.0):
-        """Send request to OpenAI with configurable timeout"""
+    def _ask_openai(self, messages, temperature=0.0):
+        """Send request to OpenAI with JSON mode enabled."""
         req = urllib2.Request(
             self.API_URL.rstrip("/") + "/chat/completions",
             data=json.dumps(
                 {
                     "model": self.MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
+                    "messages": messages,
                     "max_tokens": self.MAX_TOKENS,
                     "temperature": temperature,
+                    "response_format": {"type": "json_object"},
                 }
             ).encode("utf-8"),
             headers={
@@ -5444,18 +6247,32 @@ class BurpExtender(
         data = json.loads(resp.read())
         return data["choices"][0]["message"]["content"]
 
-    def _ask_claude(self, prompt, temperature=0.0):
-        """Send request to Claude with configurable timeout"""
+    def _ask_claude(self, messages, temperature=0.0):
+        """Send request to Claude with system/user role separation."""
+        # Claude supports system as a top-level param, not in messages
+        system_text = ""
+        user_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_text = m["content"]
+            else:
+                user_messages.append(m)
+        if not user_messages:
+            user_messages = [{"role": "user", "content": system_text}]
+            system_text = ""
+
+        payload = {
+            "model": self.MODEL,
+            "max_tokens": self.MAX_TOKENS,
+            "temperature": temperature,
+            "messages": user_messages,
+        }
+        if system_text:
+            payload["system"] = system_text
+
         req = urllib2.Request(
             self.API_URL.rstrip("/") + "/messages",
-            data=json.dumps(
-                {
-                    "model": self.MODEL,
-                    "max_tokens": self.MAX_TOKENS,
-                    "temperature": temperature,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-            ).encode("utf-8"),
+            data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
                 "x-api-key": self.API_KEY,
@@ -5467,17 +6284,20 @@ class BurpExtender(
         data = json.loads(resp.read())
         return data["content"][0]["text"]
 
-    def _ask_gemini(self, prompt, temperature=0.0):
-        """Send request to Google Gemini with configurable timeout"""
+    def _ask_gemini(self, messages, temperature=0.0):
+        """Send request to Google Gemini with JSON mode enabled."""
+        # Gemini uses 'contents' with parts — concatenate all messages
+        prompt_text = "\n".join(m["content"] for m in messages)
         req = urllib2.Request(
             self.API_URL.rstrip("/")
             + "/models/%s:generateContent?key=%s" % (self.MODEL, self.API_KEY),
             data=json.dumps(
                 {
-                    "contents": [{"parts": [{"text": prompt}]}],
+                    "contents": [{"parts": [{"text": prompt_text}]}],
                     "generationConfig": {
                         "maxOutputTokens": self.MAX_TOKENS,
                         "temperature": temperature,
+                        "responseMimeType": "application/json",
                     },
                 }
             ).encode("utf-8"),
@@ -5488,20 +6308,43 @@ class BurpExtender(
         data = json.loads(resp.read())
         return data["candidates"][0]["content"]["parts"][0]["text"]
 
-    def _ask_openai_compatible(self, prompt, temperature=0.0):
-        """Send request to OpenAI-compatible API (OpenRouter, Together AI, Groq, etc.)"""
-        # Ensure str (bytes) not unicode for Jython compatibility
+    def _ask_openai_compatible(self, messages, temperature=0.0):
+        """Send request to OpenAI-compatible API."""
         base_url = str(self.API_URL.rstrip("/"))
         api_key = str(self.API_KEY)
         model = str(self.MODEL)
 
-        payload = json.dumps({
+        # Validate messages before sending
+        if not messages or not isinstance(messages, list):
+            self.stderr.println("[!] Invalid messages format: %s" % type(messages))
+            return None
+
+        # Ensure all messages have required fields
+        for i, msg in enumerate(messages):
+            if not isinstance(msg, dict) or "role" not in msg or "content" not in msg:
+                self.stderr.println("[!] Invalid message at index %d: %s" % (i, msg))
+                return None
+
+        # Note: response_format is NOT included because many OpenRouter models
+        # (e.g., DeepSeek R1, Claude, Gemini) don't support it and return 400.
+        # The prompts already request JSON output explicitly.
+        payload_dict = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "max_tokens": self.MAX_TOKENS,
             "temperature": temperature,
-        })
-        req = urllib2.Request(base_url + "/chat/completions", data=payload)
+        }
+
+        try:
+            payload = json.dumps(payload_dict, ensure_ascii=True)
+        except Exception as json_err:
+            self.stderr.println("[!] JSON encoding failed: %s" % json_err)
+            return None
+
+        payload_bytes = payload.encode("utf-8")
+
+
+        req = urllib2.Request(base_url + "/chat/completions", data=payload_bytes)
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + api_key)
         req.add_header("HTTP-Referer", "https://code-x.my")
@@ -5517,7 +6360,7 @@ class BurpExtender(
         try:
             json.loads(text)
             return text
-        except:
+        except Exception:
             pass
 
         last_brace = text.rfind("}")
@@ -5528,7 +6371,7 @@ class BurpExtender(
                     fixed = prefix + "\n]"
                     json.loads(fixed)
                     return fixed
-                except:
+                except Exception:
                     pass
         return "[]"
 
